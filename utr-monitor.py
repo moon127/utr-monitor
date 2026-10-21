@@ -1578,7 +1578,7 @@ function renderCost(){
  c.width=W*dpr;c.height=H*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);ctx.font='11px system-ui,sans-serif';
  const B=win(S.details).filter(s=>s.cpu_all!=null&&s.vpn_bps!=null);
  const pts=B.map(s=>({x:s.vpn_bps*8/1e6,z:(s.nonvpn_bps||0)*8/1e6,y:(s.cpu_sy||0)+(s.cpu_si||0),
-  tp:(s.grp?.teleport||0),tq:(s.grp?.teleport_poll||0),all:s.cpu_all,vpn:s.vpn}));
+  tp:(s.grp?.teleport||0),tq:(s.grp?.teleport_poll||0),all:s.cpu_all,vpn:s.vpn,wan:(s.wan_bps||0)*8/1e6}));
  const P={l:46,r:10,t:8,b:30},pw=W-P.l-P.r,ph=H-P.t-P.b;
  if(pts.length<3){ctx.fillStyle=css('--muted');ctx.fillText('Collecting data…',P.l,P.t+ph/2);$('tcost-txt').innerHTML='';return}
  const xm=niceMax(Math.max(1,...pts.map(p=>p.x))*1.05),ym=niceMax(Math.max(1,...pts.map(p=>p.y))*1.1);
@@ -1599,14 +1599,17 @@ function renderCost(){
   ctx.strokeStyle=css('--c4');ctx.lineWidth=1.8;ctx.beginPath();ctx.moveTo(X(0),Y(Math.max(0,f(0))));ctx.lineTo(X(xm),Y(Math.max(0,Math.min(ym,f(xm)))));ctx.stroke()}
  const avg=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
  const tp=avg(pts.map(p=>p.tp)),tq=avg(pts.map(p=>p.tq));
- const on=pts.filter(p=>p.vpn===1).map(p=>p.all),off=pts.filter(p=>p.vpn===0).map(p=>p.all);
+ let on=pts.filter(p=>p.vpn===1&&p.wan<1).map(p=>p.all),off=pts.filter(p=>p.vpn===0&&p.wan<1).map(p=>p.all),qlab=' while idle (WAN under 1 Mb/s)';
+ if(on.length<3||off.length<3){on=pts.filter(p=>p.vpn===1).map(p=>p.all);off=pts.filter(p=>p.vpn===0).map(p=>p.all);qlab=''}
  const rows=[[`Teleport processes`,`<b>${fmtPct(tp)}</b> of CPU on average, plus <b>${fmtPct(tq)}</b> for status polling by other daemons`]];
  if(fit){const per10=fit.b[1]*10;
   rows.push(['VPN traffic',`≈ <b>${per10.toFixed(1)}%</b> extra kernel CPU per 10 Mb/s through the tunnel (encryption + forwarding; R² ${fit.r2.toFixed(2)}, ${fit.n} points)`]);
   if(two)rows.push(['Non-VPN traffic',`≈ <b>${(fit.b[2]*10).toFixed(1)}%</b> per 10 Mb/s, so the encryption premium is ≈ ${((fit.b[1]-fit.b[2])*10).toFixed(1)}% per 10 Mb/s`]);
-  rows.push(['Idle tunnel',`≈ ${fmtPct(Math.max(0,fit.b[0]))} kernel CPU with no traffic`]);
+  rows.push(['At 0 Mb/s',`≈ ${fmtPct(Math.max(0,fit.b[0]))} kernel CPU. This is the router's baseline, mostly not Teleport; see "VPN up vs down"`]);
+  const quiet=pts.filter(p=>p.wan<1).map(p=>p.all),base=quiet.length>=3?avg(quiet):Math.min(...pts.map(p=>p.all));
+  if(fit.b[1]>0)rows.push(['Ceiling',`CPU would reach 100% at ≈ <b>${Math.round((100-base)/(fit.b[1]))} Mb/s</b> through the tunnel, from a ${fmtPct(base)} baseline (projected)`]);
  }else rows.push(['VPN traffic',`<span class="muted">Needs a wider range of VPN throughput (at least 2 Mb/s spread). Run a speed test through the tunnel.</span>`]);
- if(on.length>=3&&off.length>=3)rows.push(['VPN up vs down',`total CPU ${fmtPct(avg(on))} with the VPN up vs ${fmtPct(avg(off))} with it down`]);
+ if(on.length>=3&&off.length>=3)rows.push(['VPN up vs down',`total CPU ${fmtPct(avg(on))} with the VPN up vs ${fmtPct(avg(off))} with it down${qlab}`]);
  $('tcost-txt').innerHTML=`<dl>${rows.map(([k,v])=>`<dt>${k}</dt><dd style="white-space:normal">${v}</dd>`).join('')}</dl>
   <div class="muted" style="font-size:12px;margin-top:6px">Percentages are of the whole CPU (all cores), over the selected window. WireGuard's encryption runs in kernel workers and softirq shared with normal routing, so it's estimated from how kernel CPU rises with tunnel traffic. For a direct comparison, turn Teleport off for a few minutes and use "VPN up vs down".</div>`;
 }
