@@ -255,7 +255,9 @@ DETAIL_CMD = "; ".join([
     "ip route show default", "echo @S@",
     "ip -4 -o addr", "echo @S@",
     "cat /proc/net/wireless", "echo @S@",
-    "cat /proc/uptime /proc/sys/kernel/random/boot_id /etc/version 2>/dev/null",
+    "cat /proc/uptime /proc/sys/kernel/random/boot_id /etc/version 2>/dev/null", "echo @S@",
+    "brctl showmacs br-lan 2>/dev/null", "echo @S@",
+    'for p in /sys/class/net/br-lan/brif/*; do echo "${p##*/} $(cat "$p/port_no")"; done 2>/dev/null',
 ]).replace("@S@", SEP)
 
 BAND = {"ng": "2.4 GHz", "na": "5 GHz", "6e": "6 GHz"}
@@ -284,9 +286,9 @@ def _json(text, default=None):
 def parse_detail(text, now):
     """Turn the DETAIL_CMD output into (state, series, events)."""
     p = [x.strip() for x in text.split(SEP)]
-    p += [""] * (12 - len(p))
+    p += [""] * (14 - len(p))
     (mca_t, tele_t, hs_t, xfer_t, ping_t, lease_t, arp_t, ev_t,
-     route_t, addr_t, wl_t, misc_t) = p[:12]
+     route_t, addr_t, wl_t, misc_t, fdb_t, brif_t) = p[:14]
     mca = _json(mca_t, {}) or {}
     if not isinstance(mca, dict):
         mca = {}
@@ -384,15 +386,34 @@ def parse_detail(text, now):
                 "uptime": s.get("uptime"), "idle": s.get("idletime"),
                 "rx_bytes": s.get("rx_bytes"), "tx_bytes": s.get("tx_bytes"),
                 "satisfaction": _sat(s.get("satisfaction")), "std": std})
+    # Bridge forwarding table: which bridge port each MAC was last seen on, and how long ago.
+    # ARP entries linger after a Wi-Fi client leaves, so this is what decides "wired".
+    ports, fdb = {}, {}
+    for ln in brif_t.splitlines():
+        f = ln.split()
+        if len(f) == 2:
+            try:
+                ports[int(f[1], 0)] = f[0]
+            except ValueError:
+                pass
+    for ln in fdb_t.splitlines():
+        f = ln.split()
+        if len(f) >= 4 and f[0].isdigit() and f[2] == "no":
+            fdb[f[1].lower()] = (ports.get(int(f[0]), ""), _num(f[3]))
     for ln in arp_t.splitlines()[1:]:
         f = ln.split()
         if len(f) >= 6 and f[5].startswith("br-") and f[2] == "0x2" and f[3].lower() not in seen:
             mac = f[3].lower()
+            port = None
+            if fdb:
+                port, age = fdb.get(mac, (None, None))
+                if not port or port.startswith("ath") or age is None or age > 300:
+                    continue  # a Wi-Fi client that has left, or not heard from recently
             seen.add(mac)
             clients.append({
                 "mac": mac, "name": leases.get(mac, {}).get("host", ""), "ip": f[0],
-                "conn": "Wired · LAN port" if f[5] == "br-lan" else f"Wired · {f[5]}",
-                "iface": f[5], "wired": True})
+                "conn": "Wired · LAN port" if (port or "eth").startswith("eth") else f"Wired · {port}",
+                "iface": port or f[5], "wired": True})
 
     # WAN uplinks
     portal = {}
