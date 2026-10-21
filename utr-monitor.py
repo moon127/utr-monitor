@@ -303,7 +303,7 @@ def parse_detail(text, now):
     addrs = {}
     for ln in addr_t.splitlines():
         m = re.match(r"\d+:\s+(\S+)\s+inet\s+([\d.]+)/", ln)
-        if m:
+        if m and not m.group(2).startswith("169.254."):  # link-local means no real lease
             addrs.setdefault(m.group(1), m.group(2))
 
     routes = []
@@ -413,10 +413,11 @@ def parse_detail(text, now):
         signal = None
         if i in bridges:
             v = bridges[i]
-            kind = f"Wi-Fi {v['essid']} {v['band']}".strip()
-            signal = wireless.get(i)
-            if signal is None:
-                signal = next((n["signal"] for n in neighbours if n["bssid"] == v["bssid"]), None)
+            kind = " ".join(x for x in ("Wi-Fi", v["essid"] or "uplink", v["band"]) if x)
+            if v["essid"] and addrs.get(i):  # only an associated uplink has a meaningful signal
+                signal = wireless.get(i)
+                if signal is None or signal <= -95:
+                    signal = next((n["signal"] for n in neighbours if n["bssid"] == v["bssid"]), None)
         elif i.startswith("usb"):
             kind = "USB tether"
         elif i.startswith("eth"):

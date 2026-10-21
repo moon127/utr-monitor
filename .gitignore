@@ -12,3 +12,6 @@ __pycache__/
 
 # Probe output (contains MACs, IPs, SSIDs)
 utr-probe-report*.txt
+
+# --once output (contains MACs, IPs, SSIDs)
+utr-state*.json
