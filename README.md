@@ -8,7 +8,11 @@ The UTR's management UI shows very little, but the device has an SSH CLI with a
 BusyBox shell and UniFi's own status tools. `utr-monitor.py` logs in over SSH,
 polls the router and serves a web page with live charts and tables.
 
-![UTR Monitor dashboard (demo data)](docs/screenshot.png)
+| Classic theme | UniFi style theme (CPU breakdown expanded) |
+|---|---|
+| ![UTR Monitor, Classic theme (demo data)](docs/screenshot-classic.png) | ![UTR Monitor, UniFi style theme (demo data)](docs/screenshot-unifi.png) |
+
+Screenshots use `--demo` data.
 
 `utr-probe.py` is a companion read-only discovery tool: it runs a fixed set of
 commands on the router and writes a report (secrets redacted) showing what your
