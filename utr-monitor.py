@@ -1244,6 +1244,11 @@ tr.sel td{color:var(--c1);font-weight:600}tbody.pick tr{cursor:pointer}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:0}dt{color:var(--muted)}dd{margin:0}
 .evs{max-height:360px;overflow-y:auto}
 .empty{color:var(--muted);padding:6px 0}
+h3{font-size:12.5px;margin:0 0 4px;font-weight:600}
+button.tgl{margin-left:auto;font-size:12px;font-weight:400;padding:2px 9px}button.tgl:hover{border-color:var(--c1);color:var(--c1)}
+.cpu-more{display:none}.cpu-card.open{grid-column:1/-1}
+.cpu-card.open .cpu-grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(min(360px,100%),1fr))}
+.cpu-card.open .cpu-more{display:block}
 </style></head><body>
 <header>
  <h1>UTR Monitor</h1><span id="host" class="muted"></span>
@@ -1261,14 +1266,17 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:0}dt{c
  <div class="card tile"><div class="k">Router</div><div id="t-sys"></div></div>
 </section>
 <main>
- <div class="card"><h2>CPU</h2><div class="legend" id="lg-cpu"></div><canvas id="cpu"></canvas></div>
+ <div class="card cpu-card" id="cpucard"><h2>CPU <button id="cpumore" class="tgl" aria-expanded="false" aria-controls="cpucard">Show breakdown ▸</button></h2>
+  <div class="cpu-grid">
+   <div><div class="legend" id="lg-cpu"></div><canvas id="cpu"></canvas></div>
+   <div class="cpu-more"><h3>By type <span class="muted" style="font-weight:400">· per detail poll</span></h3><div class="legend" id="lg-cpubk"></div><canvas id="cpubk"></canvas></div>
+   <div class="cpu-more"><h3>By group <span class="muted" style="font-weight:400">· per detail poll</span></h3><div class="legend" id="lg-cpugrp"></div><canvas id="cpugrp"></canvas></div>
+  </div></div>
  <div class="card"><h2>Memory</h2><div class="legend" id="lg-mem"></div><canvas id="mem"></canvas></div>
  <div class="card"><h2>Throughput <select id="iface"></select></h2><div class="legend" id="lg-net"></div><canvas id="net"></canvas></div>
  <div class="card"><h2>WAN latency</h2><div class="legend" id="lg-lat"></div><canvas id="lat"></canvas></div>
  <div class="card"><h2>Channel utilisation</h2><div class="legend" id="lg-cu"></div><canvas id="cu"></canvas></div>
  <div class="card"><h2>Wi-Fi uplink signal</h2><div class="legend" id="lg-usig"></div><canvas id="usig"></canvas></div>
- <div class="card"><h2>CPU by type <span class="muted" style="font-weight:400">· per detail poll</span></h2><div class="legend" id="lg-cpubk"></div><canvas id="cpubk"></canvas></div>
- <div class="card"><h2>CPU by group</h2><div class="legend" id="lg-cpugrp"></div><canvas id="cpugrp"></canvas></div>
 </main>
 <section class="wide">
  <div class="card"><h2>Uplinks</h2><div class="tw" id="wans"></div></div>
@@ -1594,6 +1602,12 @@ $('reset').onclick=async()=>{
  const r=await fetch('/api/reset',{method:'POST',headers:{'X-UTR-Reset':'1'}});
  if(r.ok){S.samples=[];S.details=[];S.events=[];S.last=S.dlast=0;S.iface=null;renderInfo();renderCharts()}else alert('Reset failed: '+r.status)};
 $('win').onchange=()=>{renderInfo();renderCharts()};window.addEventListener('resize',renderCharts);
+function setCpu(open){$('cpucard').classList.toggle('open',open);const b=$('cpumore');
+ b.textContent=open?'Hide breakdown ▾':'Show breakdown ▸';b.setAttribute('aria-expanded',String(open));
+ try{localStorage.setItem('utr.cpuBreakdown',open?'1':'0')}catch(e){}
+ renderCharts()}
+$('cpumore').onclick=()=>setCpu(!$('cpucard').classList.contains('open'));
+setCpu((()=>{try{return localStorage.getItem('utr.cpuBreakdown')==='1'}catch(e){return false}})());
 poll();
 </script></body></html>"""
 
