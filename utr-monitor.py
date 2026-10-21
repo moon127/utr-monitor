@@ -1346,12 +1346,10 @@ main{display:grid;gap:14px;padding:0 16px 14px;grid-template-columns:repeat(auto
 .sec{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:6px 16px 10px;
  padding-bottom:6px;border-bottom:1px solid var(--grid)}
 main.netc{grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr))}
-/* ---- "UniFi style" theme: same layout, network-console look ---- */
-:root[data-skin=unifi]{--bg:#f4f5f6;--card:#fff;--fg:#212327;--muted:#7d8590;--grid:#e9ebed;--chip:#eef0f2;--head:#f8f9fa;
- --accent:#006fff;--c1:#006fff;--c2:#f5a524;--c3:#17b26a;--c4:#7a5af8;--c5:#ee46bc;--bad:#f04438;--ok:#17b26a;--warn:#f79009}
-@media (prefers-color-scheme:dark){:root[data-skin=unifi]{--bg:#121315;--card:#1b1d20;--fg:#e8e9eb;--muted:#8b919a;--grid:#2a2d31;
+/* ---- "UniFi style" theme: same layout, dark network-console look (always dark) ---- */
+:root[data-skin=unifi]{color-scheme:dark;--bg:#121315;--card:#1b1d20;--fg:#e8e9eb;--muted:#8b919a;--grid:#2a2d31;
  --chip:#25282c;--head:#202327;--accent:#4797ff;--c1:#4797ff;--c2:#fdb022;--c3:#32d583;--c4:#9b8afb;--c5:#f670c7;
- --bad:#f97066;--ok:#32d583;--warn:#fdb022}}
+ --bad:#f97066;--ok:#32d583;--warn:#fdb022}
 :root[data-skin=unifi] body{font-size:13px}
 :root[data-skin=unifi] header{background:var(--card);border-bottom:1px solid var(--grid);padding:10px 20px;margin-bottom:18px;
  position:sticky;top:0;z-index:5}
@@ -1359,7 +1357,7 @@ main.netc{grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr))}
 :root[data-skin=unifi] h1::before{content:"";width:18px;height:18px;border-radius:5px;background:var(--accent);
  box-shadow:inset 0 0 0 5px color-mix(in srgb,var(--accent) 70%,#fff)}
 :root[data-skin=unifi] .tiles,:root[data-skin=unifi] main,:root[data-skin=unifi] .wide{padding-left:20px;padding-right:20px;gap:16px}
-:root[data-skin=unifi] .card{border-radius:8px;padding:14px 16px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+:root[data-skin=unifi] .card{border-radius:8px;padding:14px 16px;box-shadow:0 1px 2px rgba(0,0,0,.25)}
 :root[data-skin=unifi] .card h2{font-size:14px;margin-bottom:10px}
 :root[data-skin=unifi] .sec{text-transform:none;letter-spacing:0;font-size:17px;color:var(--fg);border:0;margin:14px 20px 10px;padding:0}
 :root[data-skin=unifi] .k{text-transform:none;letter-spacing:0;font-size:12.5px;font-weight:500}
