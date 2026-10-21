@@ -9,3 +9,6 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+
+# Probe output (contains MACs, IPs, SSIDs)
+utr-probe-report*.txt
