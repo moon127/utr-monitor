@@ -260,7 +260,15 @@ DETAIL_CMD = "; ".join([
     'for p in /sys/class/net/br-lan/brif/*; do echo "${p##*/} $(cat "$p/port_no")"; done 2>/dev/null',
 ]).replace("@S@", SEP)
 
+# Per-process CPU accounting, appended to the detail poll after its own marker.
+# `echo $$` is the poll's shell; its parent is the dropbear session serving this monitor.
+PROC_SEP = "@@UTR_PROCS@@"
+DETAIL_CMD += (f"; echo {PROC_SEP}; echo $$; cat /proc/uptime; grep '^cpu' /proc/stat; echo {SEP}; "
+               f"cat /proc/net/dev; echo {SEP}; cat /proc/[0-9]*/stat 2>/dev/null; echo {SEP}; ps w 2>/dev/null")
+
 BAND = {"ng": "2.4 GHz", "na": "5 GHz", "6e": "6 GHz"}
+TELEPORT_DAEMONS = ("teleport-client", "wireguard-client", "openvpn-client")
+SHELLS = ("sh", "ash", "bash", "busybox")
 
 
 def _num(x):
@@ -281,6 +289,37 @@ def _json(text, default=None):
         return json.loads(text) if text else default
     except ValueError:
         return default
+
+
+def parse_procs(stat_t, ps_t):
+    """Parse concatenated /proc/<pid>/stat lines (+ `ps w` for command lines)."""
+    cmds = {}
+    for ln in ps_t.splitlines()[1:]:
+        f = ln.split(None, 4)
+        if len(f) >= 5 and f[0].isdigit():
+            cmds[int(f[0])] = f[4]
+    procs = {}
+    for ln in stat_t.splitlines():
+        lp, rp = ln.find("("), ln.rfind(")")
+        if lp < 0 or rp < lp:
+            continue
+        try:
+            pid = int(ln[:lp])
+            f = ln[rp + 2:].split()
+            procs[pid] = {"pid": pid, "comm": ln[lp + 1:rp], "ppid": int(f[1]),
+                          "own": int(f[11]) + int(f[12]), "child": int(f[13]) + int(f[14]),
+                          "start": int(f[19]), "cmd": cmds.get(pid, "")}
+        except (ValueError, IndexError):
+            continue
+    return procs
+
+
+def _proc_label(p):
+    if p["ppid"] == 2 or p["pid"] == 2:
+        return f"[{p['comm']}]"
+    if p["comm"] in SHELLS and p["cmd"]:
+        return p["cmd"][:48]
+    return p["comm"]
 
 
 def parse_detail(text, now):
@@ -662,6 +701,9 @@ class Collector(threading.Thread):
         self.eseq = 0
         self.seen = set()
         self.prev_clients = {}
+        self.prev_procsnap = None
+        self.counted = {}       # (pid, start) -> ticks already attributed (or pre-window)
+        self.tpoll = set()      # (pid, start) of processes seen spawning Teleport status commands
         self.last_detail = 0.0
         if store:
             self.samples.extend(store.recent(history))
@@ -745,11 +787,143 @@ class Collector(threading.Thread):
         self.status["uptime"] = up_t.strip().splitlines()[-1] if up_t.strip() else ""
         return sample
 
+    def _cpu_accounting(self, now, text, active_wan):
+        """Attribute CPU time between two detail polls to process groups.
+
+        Live processes contribute their own utime+stime deltas. Time of children
+        that exited is credited to the parent (cutime/cstime), minus whatever was
+        already counted for those children while they were visible, so nothing is
+        counted twice. Percentages are of the whole machine (all cores).
+        """
+        parts = text.split(SEP)
+        parts += [""] * (4 - len(parts))
+        hdr = [ln for ln in parts[0].splitlines() if ln.strip()]
+        try:
+            shell_pid = int(hdr[0])
+            uptime = float(hdr[1].split()[0])
+            cpus = [ln for ln in hdr[2:] if ln.startswith("cpu")]
+            tot = [int(x) for x in cpus[0].split()[1:]][:8]
+        except (IndexError, ValueError):
+            return {}
+        tot += [0] * (8 - len(tot))
+        ncpu = max(1, len(cpus) - 1)
+        net = parse_net(parts[1])
+        procs = parse_procs(parts[2], parts[3])
+        prev, self.prev_procsnap = self.prev_procsnap, {"t": now, "tot": tot, "uptime": uptime,
+                                                         "procs": procs, "net": net}
+        keys = {pid: (pid, p["start"]) for pid, p in procs.items()}
+
+        def baseline():
+            self.counted = {k: (procs[pid]["own"] + procs[pid]["child"], procs[pid]["ppid"]) for pid, k in keys.items()}
+        if not prev:
+            baseline()
+            return {}
+        dtot = [a - b for a, b in zip(tot, prev["tot"])]
+        total, dt = sum(dtot), now - prev["t"]
+        if total <= 0 or dt <= 0:
+            baseline()
+            return {}
+        hz = total / ncpu / dt
+        mon = procs.get(shell_pid, {}).get("ppid")
+
+        # Remember who spawns Teleport status commands (e.g. the LCD or BLE daemon).
+        for pid, p in procs.items():
+            if p["comm"] in TELEPORT_DAEMONS:
+                continue
+            if "teleport" in p["cmd"] or "teleport" in p["comm"]:
+                q = p
+                for _ in range(8):
+                    par = procs.get(q["ppid"])
+                    if not par or par["pid"] in (1, mon):
+                        break
+                    if "teleport" not in par["cmd"]:
+                        self.tpoll.add(keys[par["pid"]])
+                        break
+                    q = par
+
+        def group(pid):
+            p = procs[pid]
+            if p["comm"] in TELEPORT_DAEMONS or p["comm"].startswith("wg-crypt") or \
+                    (p["comm"] == "dnsmasq" and "teleport" in p["cmd"]):
+                return "teleport"
+            if p["ppid"] == 2 or pid == 2:
+                return "kernel"
+            q = p
+            for _ in range(10):
+                if q["pid"] == mon:
+                    return "monitor"
+                if "teleport" in q["cmd"]:
+                    return "teleport_poll"
+                q = procs.get(q["ppid"])
+                if not q:
+                    break
+            return "other"
+
+        # Children that vanished since the last poll were reaped by their parent.
+        reaped = collections.defaultdict(int)
+        live = set(keys.values())
+        for key, (ticks, ppid) in self.counted.items():
+            if key not in live:
+                reaped[ppid] += ticks
+        counted, groups, items = {}, collections.defaultdict(int), []
+        for pid, p in procs.items():
+            key = keys[pid]
+            q = prev["procs"].get(pid)
+            if q and q["start"] == p["start"] and key in self.counted:
+                d_own = max(0, p["own"] - q["own"])
+                d_child = max(0, p["child"] - q["child"] - reaped.get(pid, 0))
+                done = self.counted[key][0] + d_own + d_child
+            elif p["start"] / hz >= prev["uptime"] - 1:   # started during this interval
+                d_own, d_child, done = p["own"], 0, p["own"]  # its reaped children surface via its parent later
+            else:
+                counted[key] = (p["own"] + p["child"], p["ppid"])
+                continue
+            counted[key] = (done, p["ppid"])
+            g = group(pid)
+            if d_own:
+                groups[g] += d_own
+                items.append((_proc_label(p), g, d_own))
+            if d_child:
+                gc = "teleport_poll" if key in self.tpoll and g == "other" else g
+                groups[gc] += d_child
+                items.append((_proc_label(p) + " (children)", gc, d_child))
+        self.counted = counted
+        self.tpoll &= live
+
+        pc = lambda ticks: round(100.0 * ticks / total, 2)
+        busy = total - dtot[3] - dtot[4]
+        groups["unattributed"] = max(0, busy - sum(groups.values()))
+        merged = collections.defaultdict(lambda: [None, 0])
+        for label, g, ticks in items:
+            merged[label][0] = g
+            merged[label][1] += ticks
+        top = sorted(merged.items(), key=lambda kv: -kv[1][1])[:12]
+
+        def rate(names):
+            b = 0
+            for n in names:
+                if n in net and n in prev["net"]:
+                    b += max(0, sum(net[n]) - sum(prev["net"][n]))
+            return round(b / dt, 1)
+        vpn_bps = rate([n for n in net if n.startswith(("wg", "tun"))])
+        wan_bps = rate([active_wan]) if active_wan else None
+        return {"cpu_all": pc(busy), "cpu_us": pc(dtot[0] + dtot[1]), "cpu_sy": pc(dtot[2]),
+                "cpu_si": pc(dtot[5] + dtot[6]), "cpu_io": pc(dtot[4]),
+                "grp": {g: pc(v) for g, v in groups.items()},
+                "top": [[label, g, pc(t)] for label, (g, t) in top if t],
+                "vpn_bps": vpn_bps, "wan_bps": wan_bps,
+                "nonvpn_bps": None if wan_bps is None else max(0.0, wan_bps - vpn_bps)}
+
     def poll_detail(self):
         t0 = time.time()
-        out = self.runner.run(DETAIL_CMD)
+        raw = self.runner.run(DETAIL_CMD)
         now = time.time()
+        out, _, proc_t = raw.partition(PROC_SEP)
         state, series, events = parse_detail(out, now)
+        try:
+            series.update(self._cpu_accounting(now, proc_t, state["system"]["active_wan"]))
+        except Exception as e:  # never let accounting break the rest of the detail poll
+            log.warning("CPU accounting failed: %s", e)
         # Per-client throughput from byte-counter deltas. The AP's tx is the client's download.
         current = {}
         for c in state["clients"]:
@@ -855,6 +1029,21 @@ class DemoRunner:
         self.net = {k: [0, 0] for k in ("lo", "eth0", "eth1", "ath1", "ath5", "br-lan", "wg0", "wifi1")}
         self.cbytes = {}
         self.vpn_cycles = 0
+        self.dlast = None
+        self.dcpu = [0] * 8
+        self.shell = 5000
+        self.procs = {  # pid: [comm, ppid, own, child, start, cmd]
+            1: ["procd", 0, 300, 900, 1, "/sbin/procd"], 2: ["kthreadd", 0, 0, 0, 1, ""],
+            7: ["ksoftirqd/0", 2, 500, 0, 2, ""], 40: ["kworker/u8:1", 2, 800, 0, 3, ""],
+            41: ["kworker/0:2", 2, 300, 0, 3, ""], 1498: ["wg-crypt-wg0", 2, 0, 0, 900, ""],
+            1566: ["dnsmasq", 1, 40, 0, 900, "/usr/sbin/dnsmasq -k -C /tmp/teleport-client.d/dnsmasq.teleport.conf"],
+            2455: ["teleport-client", 1, 1200, 50, 950, "/usr/bin/teleport-client"],
+            2456: ["wireguard-client", 1, 300, 0, 950, "/usr/bin/wireguard-client"],
+            2457: ["openvpn-client", 1, 120, 0, 950, "/usr/bin/openvpn-client"],
+            3629: ["lcm-display", 1, 600, 4000, 1000, "/usr/bin/lcm-display"],
+            2458: ["mcad", 1, 900, 200, 950, "/usr/bin/mcad"],
+            12477: ["wevent", 1, 100, 0, 1200, "/sbin/wevent"],
+            900: ["dropbear", 1, 50, 0, 2000, "/usr/sbin/dropbear -F -r /var/run/dropbear_rsa_host_key"]}
         self.ev = []
         for mono, cat, ev, det in [
                 (40, "collector", "started", {"interval": "10"}),
@@ -966,7 +1155,50 @@ class DemoRunner:
             "10: br-lan    inet 192.168.29.1/24 brd 192.168.29.255 scope global br-lan",
             f"Inter-| sta-|\n face | tus |\n  ath5: 0005   44.  {-58 + int(r(-3, 3))}.  -96.   0 0 0 0 0 0",
             f"{up}.00 1000.00\ndemo-boot\n6.6.122"]
-        return f"\n{SEP}\n".join(sections)
+        return f"\n{SEP}\n".join(sections) + "\n" + PROC_SEP + "\n" + self._procs(up)
+
+    def _procs(self, up):
+        r = random.uniform
+        now = time.time()
+        dt = now - self.dlast if self.dlast else 10.0
+        self.dlast = now
+        vpn = getattr(self, "_vpn_prev", None)
+        wg = self.net["wg0"][0] + self.net["wg0"][1]
+        mbps = (wg - vpn) * 8 / 1e6 / dt if vpn is not None else 0
+        self._vpn_prev = wg
+        hz, ncpu = 100, 4
+        total = int(hz * ncpu * dt)
+        P = self.procs
+        add = lambda pid, own=0.0, child=0.0: (P[pid].__setitem__(2, P[pid][2] + int(own * hz * dt)),
+                                               P[pid].__setitem__(3, P[pid][3] + int(child * hz * dt)))
+        crypto = 0.006 * mbps               # cores busy per Mb/s of VPN traffic
+        add(40, own=crypto * .7)
+        add(7, own=crypto * .2)
+        add(2455, own=.02 + r(0, .01))
+        add(2456, own=.004)
+        add(1566, own=.001)
+        add(3629, own=.01, child=.05 + r(0, .02))   # LCD polling utr-api get-teleport-status
+        add(2458, own=.01, child=.005)
+        add(900, child=.09 + r(0, .02))            # this monitor's previous detail poll (mca-dump)
+        sys_t = int((crypto * .1 + .04) * hz * dt)
+        si_t = int(crypto * .9 * hz * dt)
+        user_t = int((.25 + r(0, .1)) * hz * dt)
+        idle = max(0, total - sys_t - si_t - user_t)
+        for i, v in ((0, user_t), (2, sys_t), (3, idle), (6, si_t)):
+            self.dcpu[i] += v
+        self.shell += 7
+        shell_start = int((up - 1) * hz)
+        lines = [f"{pid} ({c}) S {pp} 0 0 0 0 0 0 0 0 0 {own} 0 {ch} 0 20 0 1 0 {st} 0 0"
+                 for pid, (c, pp, own, ch, st, _) in P.items()]
+        lines.append(f"{self.shell} (sh) S 900 0 0 0 0 0 0 0 0 0 2 0 0 0 20 0 1 0 {shell_start} 0 0")
+        lines.append(f"{self.shell + 1} (sh) S 3629 0 0 0 0 0 0 0 0 0 1 0 0 0 20 0 1 0 {shell_start} 0 0")
+        ps = "  PID USER       VSZ STAT COMMAND\n" + "".join(
+            f"{pid} ui 1000 S {cmd or '[' + c + ']'}\n" for pid, (c, pp, own, ch, st, cmd) in P.items())
+        ps += f"{self.shell + 1} ui 2532 S sh -c syswrapper.sh utr-api get-teleport-status\n"
+        nd = "Inter-|\n face |\n" + "".join(f"  {k}: {v[0]} 0 0 0 0 0 0 0 {v[1]} 0 0 0 0 0 0 0\n"
+                                            for k, v in self.net.items())
+        cpu = "cpu  " + " ".join(map(str, self.dcpu)) + "\n" + "".join(f"cpu{i} 0 0 0 0 0 0 0 0\n" for i in range(ncpu))
+        return (f"{self.shell}\n{up}.00 1000.00\n{cpu}{SEP}\n{nd}{SEP}\n" + "\n".join(lines) + f"\n{SEP}\n{ps}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1035,6 +1267,8 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:0}dt{c
  <div class="card"><h2>WAN latency</h2><div class="legend" id="lg-lat"></div><canvas id="lat"></canvas></div>
  <div class="card"><h2>Channel utilisation</h2><div class="legend" id="lg-cu"></div><canvas id="cu"></canvas></div>
  <div class="card"><h2>Wi-Fi uplink signal</h2><div class="legend" id="lg-usig"></div><canvas id="usig"></canvas></div>
+ <div class="card"><h2>CPU by type <span class="muted" style="font-weight:400">· per detail poll</span></h2><div class="legend" id="lg-cpubk"></div><canvas id="cpubk"></canvas></div>
+ <div class="card"><h2>CPU by group</h2><div class="legend" id="lg-cpugrp"></div><canvas id="cpugrp"></canvas></div>
 </main>
 <section class="wide">
  <div class="card"><h2>Uplinks</h2><div class="tw" id="wans"></div></div>
@@ -1046,6 +1280,10 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:0}dt{c
  <div class="two">
   <div class="card"><h2>Wi-Fi networks</h2><div class="tw" id="vaps"></div></div>
   <div class="card"><h2>Radios</h2><div class="tw" id="radios"></div></div>
+ </div>
+ <div class="two">
+  <div class="card"><h2>Teleport CPU cost <span class="chip">estimate</span></h2><canvas id="tcost" style="height:220px"></canvas><div id="tcost-txt" style="margin-top:8px"></div></div>
+  <div class="card"><h2>Top processes</h2><div class="tw" id="procs"></div></div>
  </div>
  <div class="card"><h2>Nearby networks</h2><div class="tw" id="nbrs"></div></div>
  <div class="card"><h2>Events
@@ -1122,6 +1360,9 @@ function win(arr){const cut=windowStart();if(!cut)return arr;let i=0;while(i<arr
 const MARK={internet:'--c3',vpn:'--c4',wifi_uplink:'--c2',usb_uplink:'--c5'};
 const MARK_EV=/^(internet_|vpn_|wifi_connected$|wifi_disconnected$|usb_)/;
 const markers=()=>S.events.filter(e=>MARK[e.category]&&MARK_EV.test(e.event)).map(e=>({t:e.t,color:MARK[e.category]}));
+const GRP={teleport:['Teleport','--c4'],teleport_poll:['Teleport status polling','--c5'],monitor:['This monitor','--c2'],
+ kernel:['Kernel threads','--c1'],other:['Other processes','--c3'],unattributed:['Interrupts & short-lived','--muted']};
+const fmtPct=v=>v==null?'–':(+v).toFixed(v<10?1:0)+'%';
 const wanName=i=>S.state?.wans?.find(w=>w.iface===i)?.kind||i;
 
 function ifaceList(){
@@ -1152,6 +1393,63 @@ function renderCharts(){
  i=draw('usig',DT,[{color:'--c2',values:D.map(s=>s.usig)}],{min:-90,max:-20,fmt:v=>v+' dBm',gap:dgap,markers:mk,
   empty:S.state?'No Wi-Fi uplink connected':none});
  if(i!=null){const w=S.state?.wans?.find(w=>w.signal!=null&&w.connected);legend('lg-usig',[[w?w.kind:'Signal','--c2',sig(D[i].usig)]],hv&&DT[i])}
+ const B=D.filter(s=>s.cpu_all!=null),BT=B.map(s=>s.t),bnone=S.dinterval?'Needs two detail polls…':none;
+ i=draw('cpubk',BT,[{color:'--c1',values:B.map(s=>s.cpu_us)},{color:'--c2',values:B.map(s=>s.cpu_sy)},{color:'--c5',values:B.map(s=>s.cpu_si)}],
+  {fmt:fmtPct,gap:dgap,markers:mk,empty:bnone});
+ if(i!=null)legend('lg-cpubk',[['User','--c1',fmtPct(B[i].cpu_us)],['System','--c2',fmtPct(B[i].cpu_sy)],['IRQ + softirq','--c5',fmtPct(B[i].cpu_si)],['Total','--muted',fmtPct(B[i].cpu_all)]],hv&&BT[i]);
+ const gk=Object.keys(GRP);
+ i=draw('cpugrp',BT,gk.map(k=>({color:GRP[k][1],values:B.map(s=>s.grp?.[k]??0)})),{fmt:fmtPct,gap:dgap,markers:mk,empty:bnone});
+ if(i!=null)legend('lg-cpugrp',gk.map(k=>[GRP[k][0],GRP[k][1],fmtPct(B[i].grp?.[k]??0)]),hv&&BT[i]);
+ renderCost();
+}
+
+function ols(pts,keys){ // least squares y = b0 + b1*x1 (+ b2*x2)
+ const n=pts.length,k=keys.length+1,X=pts.map(p=>[1,...keys.map(c=>p[c])]),y=pts.map(p=>p.y);
+ const A=[...Array(k)].map((_,i)=>[...Array(k)].map((_,j)=>X.reduce((s,r)=>s+r[i]*r[j],0)));
+ const v=[...Array(k)].map((_,i)=>X.reduce((s,r,m)=>s+r[i]*y[m],0));
+ for(let c=0;c<k;c++){let p=c;for(let r=c+1;r<k;r++)if(Math.abs(A[r][c])>Math.abs(A[p][c]))p=r;
+  [A[c],A[p]]=[A[p],A[c]];[v[c],v[p]]=[v[p],v[c]];if(Math.abs(A[c][c])<1e-9)return null;
+  for(let r=0;r<k;r++)if(r!==c){const f=A[r][c]/A[c][c];for(let j=c;j<k;j++)A[r][j]-=f*A[c][j];v[r]-=f*v[c]}}
+ const b=v.map((x,i)=>x/A[i][i]),ym=y.reduce((a,c)=>a+c,0)/n;
+ const ssr=pts.reduce((s,p,m)=>s+(y[m]-X[m].reduce((a,x,j)=>a+x*b[j],0))**2,0),sst=y.reduce((s,c)=>s+(c-ym)**2,0);
+ return{b,r2:sst?1-ssr/sst:0,n};
+}
+function renderCost(){
+ const c=$('tcost'),ctx=c.getContext('2d'),dpr=window.devicePixelRatio||1,W=c.clientWidth,H=c.clientHeight;
+ c.width=W*dpr;c.height=H*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);ctx.font='11px system-ui,sans-serif';
+ const B=win(S.details).filter(s=>s.cpu_all!=null&&s.vpn_bps!=null);
+ const pts=B.map(s=>({x:s.vpn_bps*8/1e6,z:(s.nonvpn_bps||0)*8/1e6,y:(s.cpu_sy||0)+(s.cpu_si||0),
+  tp:(s.grp?.teleport||0),tq:(s.grp?.teleport_poll||0),all:s.cpu_all,vpn:s.vpn}));
+ const P={l:46,r:10,t:8,b:30},pw=W-P.l-P.r,ph=H-P.t-P.b;
+ if(pts.length<3){ctx.fillStyle=css('--muted');ctx.fillText('Collecting data…',P.l,P.t+ph/2);$('tcost-txt').innerHTML='';return}
+ const xm=niceMax(Math.max(1,...pts.map(p=>p.x))*1.05),ym=niceMax(Math.max(1,...pts.map(p=>p.y))*1.1);
+ const X=x=>P.l+x/xm*pw,Y=y=>P.t+ph-y/ym*ph;
+ ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--muted');ctx.textAlign='right';ctx.textBaseline='middle';
+ for(let i=0;i<=4;i++){const v=ym*i/4,y=Math.round(Y(v))+.5;ctx.beginPath();ctx.moveTo(P.l,y);ctx.lineTo(W-P.r,y);ctx.stroke();ctx.fillText(fmtPct(v),P.l-6,y)}
+ ctx.textAlign='center';ctx.textBaseline='top';
+ for(let i=0;i<=4;i++){const v=xm*i/4;ctx.fillText((+v.toFixed(1))+'',X(v),P.t+ph+4)}
+ ctx.fillText('VPN throughput (Mb/s) → vs kernel CPU (system + softirq)',P.l+pw/2,P.t+ph+17);
+ ctx.fillStyle=css('--c4');ctx.globalAlpha=.55;for(const p of pts){ctx.beginPath();ctx.arc(X(p.x),Y(p.y),2.6,0,7);ctx.fill()}ctx.globalAlpha=1;
+ const xs=pts.map(p=>p.x),zs=pts.map(p=>p.z),spread=a=>Math.max(...a)-Math.min(...a);
+ const corr=(()=>{const n=xs.length,mx=xs.reduce((a,b)=>a+b,0)/n,mz=zs.reduce((a,b)=>a+b,0)/n;let sxz=0,sxx=0,szz=0;
+  for(let i=0;i<n;i++){sxz+=(xs[i]-mx)*(zs[i]-mz);sxx+=(xs[i]-mx)**2;szz+=(zs[i]-mz)**2}return sxx&&szz?sxz/Math.sqrt(sxx*szz):1})();
+ const ok=spread(xs)>=2&&pts.length>=6;
+ let two=ok&&spread(zs)>=2&&pts.length>=10&&Math.abs(corr)<0.9,fit=two?ols(pts,['x','z']):null; // separate the two only if they vary independently
+ if(!fit){two=false;fit=ok?ols(pts,['x']):null}
+ if(fit){const zbar=two?zs.reduce((a,b)=>a+b,0)/zs.length:0,f=x=>fit.b[0]+fit.b[1]*x+(two?fit.b[2]*zbar:0);
+  ctx.strokeStyle=css('--c4');ctx.lineWidth=1.8;ctx.beginPath();ctx.moveTo(X(0),Y(Math.max(0,f(0))));ctx.lineTo(X(xm),Y(Math.max(0,Math.min(ym,f(xm)))));ctx.stroke()}
+ const avg=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
+ const tp=avg(pts.map(p=>p.tp)),tq=avg(pts.map(p=>p.tq));
+ const on=pts.filter(p=>p.vpn===1).map(p=>p.all),off=pts.filter(p=>p.vpn===0).map(p=>p.all);
+ const rows=[[`Teleport processes`,`<b>${fmtPct(tp)}</b> of CPU on average, plus <b>${fmtPct(tq)}</b> for status polling by other daemons`]];
+ if(fit){const per10=fit.b[1]*10;
+  rows.push(['VPN traffic',`≈ <b>${per10.toFixed(1)}%</b> extra kernel CPU per 10 Mb/s through the tunnel (encryption + forwarding; R² ${fit.r2.toFixed(2)}, ${fit.n} points)`]);
+  if(two)rows.push(['Non-VPN traffic',`≈ <b>${(fit.b[2]*10).toFixed(1)}%</b> per 10 Mb/s, so the encryption premium is ≈ ${((fit.b[1]-fit.b[2])*10).toFixed(1)}% per 10 Mb/s`]);
+  rows.push(['Idle tunnel',`≈ ${fmtPct(Math.max(0,fit.b[0]))} kernel CPU with no traffic`]);
+ }else rows.push(['VPN traffic',`<span class="muted">Needs a wider range of VPN throughput (at least 2 Mb/s spread). Run a speed test through the tunnel.</span>`]);
+ if(on.length>=3&&off.length>=3)rows.push(['VPN up vs down',`total CPU ${fmtPct(avg(on))} with the VPN up vs ${fmtPct(avg(off))} with it down`]);
+ $('tcost-txt').innerHTML=`<dl>${rows.map(([k,v])=>`<dt>${k}</dt><dd style="white-space:normal">${v}</dd>`).join('')}</dl>
+  <div class="muted" style="font-size:12px;margin-top:6px">Percentages are of the whole CPU (all cores), over the selected window. WireGuard's encryption runs in kernel workers and softirq shared with normal routing, so it's estimated from how kernel CPU rises with tunnel traffic. For a direct comparison, turn Teleport off for a few minutes and use "VPN up vs down".</div>`;
 }
 
 function tile(id,v,s,cls){$(id).innerHTML=`<div class="v ${cls||''}">${v}</div><div class="s">${s||'&nbsp;'}</div>`}
@@ -1211,6 +1509,12 @@ function renderInfo(){
   table('radios',['Band','#Channel','#Busy','#Own tx / rx','#Noise floor','#Max power','#Experience'],st.radios.map(r=>[esc(r.band),
    `${esc(r.channel??'–')} / ${esc(r.bw??'–')} MHz`,pct(r.cu_total),`${r.cu_self_tx??'–'}% / ${r.cu_self_rx??'–'}%`,
    r.noise!=null?esc(r.noise)+' dBm':'–',r.max_txpower!=null?esc(r.max_txpower)+' dBm':'–',exp(r.satisfaction)]));
+  const PW=win(S.details).filter(s=>s.top),agg={};
+  PW.forEach((s,k)=>{for(const[l,g,v]of s.top){const a=agg[l]||(agg[l]={g,sum:0,now:null});a.sum+=v;if(k===PW.length-1)a.now=v}});
+  const pr=Object.entries(agg).map(([l,a])=>[l,a.g,a.now,a.sum/PW.length]).sort((a,b)=>b[3]-a[3]).slice(0,14);
+  table('procs',['Process','Group','#Now','#Window avg'],pr.map(([l,g,n,a])=>[esc(l),
+   `<span class="chip" style="color:var(${GRP[g]?.[1]||'--muted'})">${esc(GRP[g]?.[0]||g)}</span>`,fmtPct(n),fmtPct(a)]),
+   {empty:'Needs two detail polls'});
   table('nbrs',['Network','BSSID','Band','#Ch','#Signal','Security','Device'],st.neighbours.map(n=>[n.essid?esc(n.essid):'<span class="muted">(hidden)</span>',
    `<span class="muted">${esc(n.bssid)}</span>`,esc(n.band),esc(n.channel),sig(n.signal),esc(n.security),esc(n.model||'')]),{empty:'No scan results (the UTR only scans its uplink channel)'});
  }
@@ -1279,7 +1583,7 @@ async function poll(){
  }catch(e){$('dot').style.background=css('--bad');$('st').textContent='web server unreachable';console.error(e)}
  setTimeout(poll,Math.max(1000,S.interval*1000));
 }
-for(const id of['cpu','mem','net','lat','cu','usig']){const c=$(id);
+for(const id of['cpu','mem','net','lat','cu','usig','cpubk','cpugrp']){const c=$(id);
  c.addEventListener('mousemove',e=>{const g=c._geo;if(!g)return;S.hoverT=g.t0+(e.offsetX-g.P.l)/g.pw*(g.t1-g.t0);renderCharts()});
  c.addEventListener('mouseleave',()=>{S.hoverT=null;renderCharts()})}
 $('iface').onchange=e=>{S.iface=e.target.value;renderInfo();renderCharts()};

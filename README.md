@@ -35,6 +35,10 @@ firmware exposes.
 - **Wi-Fi networks and radios:** channel, width, client count, transmit
   power, channel utilisation, noise floor
 - **Nearby networks** from the radio scan tables
+- **CPU accounting:** CPU split by type (user, system, IRQ + softirq) and by
+  group (Teleport, Teleport status polling, this monitor, kernel threads,
+  other, interrupts and short-lived processes), a top-processes table, and an
+  estimate of Teleport's CPU cost
 - **Events:** the router's `utr-runtime-events.log` (internet up/down, Wi-Fi
   uplink, DHCP, VPN, USB tether, Bluetooth) as a filterable timeline, with
   markers on the charts
@@ -138,6 +142,28 @@ Memory "used" excludes buffers and page cache (it's `MemTotal − MemAvailable` 
 | `/tmp/leases.*`, `/proc/net/arp` | Client hostnames and wired LAN clients |
 | `/var/log/utr-runtime-events.log` | Event timeline. Times come from boot time plus each event's monotonic counter, and events are de-duplicated by boot ID and line |
 | `ip route`, `ip addr`, `/proc/net/wireless` | Default-route fallback, WAN addresses, live uplink signal |
+
+The detail poll also snapshots `/proc/stat`, every `/proc/<pid>/stat`, `ps w`
+and `/proc/net/dev`, and diffs them against the previous poll:
+
+- Live processes contribute their own CPU time. Children that exited are
+  credited to their parent, minus anything already counted while they were
+  visible, so nothing is counted twice.
+- **Teleport** is `teleport-client`, `wireguard-client`, `openvpn-client`,
+  the Teleport `dnsmasq` and `wg-crypt-*`. **Teleport status polling** is
+  other daemons (for example the LCD) running `utr-api get-teleport-status`
+  scripts; it's an estimate, since those parents may run other scripts too.
+  **This monitor** is the dropbear session serving the monitor and
+  everything it runs, including `mca-dump`.
+- WireGuard encrypts in kernel workers and softirq shared with ordinary
+  routing, so the **Teleport CPU cost** panel fits kernel CPU (system +
+  softirq) against tunnel throughput: the slope is the cost per 10 Mb/s and
+  the intercept is the idle-tunnel cost. When non-VPN traffic varies
+  independently, a second term separates the encryption premium from plain
+  forwarding. With data from both VPN-up and VPN-down periods in the
+  window, it also compares total CPU directly.
+
+All CPU percentages are of the whole machine (all cores).
 
 Each part degrades on its own: if `mca-dump` isn't available, the VPN, latency
 and event panels still work. The header shows how long the detail poll took.
