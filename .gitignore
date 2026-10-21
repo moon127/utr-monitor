@@ -15,3 +15,6 @@ utr-probe-report*.txt
 
 # --once output (contains MACs, IPs, SSIDs)
 utr-state*.json
+
+# macOS Finder metadata
+.DS_Store
