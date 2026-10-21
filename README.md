@@ -31,7 +31,7 @@ firmware exposes.
   current window; WireGuard handshake age and transfer
 - **Clients:** name, IP, network and band, signal, link rates, live and total
   traffic, Wi-Fi standard, connected time and UniFi's experience score; wired
-  LAN clients too
+  LAN clients with port link speed and traffic
 - **Wi-Fi networks and radios:** channel, width, client count, transmit
   power, channel utilisation, noise floor
 - **Nearby networks** from the radio scan tables
@@ -206,5 +206,8 @@ compacts the file. Events already in the router's log aren't re-imported afterwa
   are often reset or re-adopted. Don't use this on a network you don't trust.
 - The web server has no authentication, and anyone who can reach it can reset
   the history. Keep the default `127.0.0.1` bind unless you need LAN access.
+- Wired clients' traffic comes from the LAN port's counters, since the router
+  doesn't count per wired device. With one device on the port it's exact; with
+  several, each shows the shared port total, labelled as such.
 - Interface counters that reset or wrap are skipped for that sample rather than
   shown as a spike.

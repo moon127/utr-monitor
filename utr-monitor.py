@@ -439,6 +439,8 @@ def parse_detail(text, now):
         f = ln.split()
         if len(f) >= 4 and f[0].isdigit() and f[2] == "no":
             fdb[f[1].lower()] = (ports.get(int(f[0]), ""), _num(f[3]))
+    lan_speed = {l.get("interface"): l.get("speed") for l in mca.get("lan_table") or [] if l.get("interface")}
+    lan_port = next((i for i in lan_speed if i.startswith("eth")), None)
     for ln in arp_t.splitlines()[1:]:
         f = ln.split()
         if len(f) >= 6 and f[5].startswith("br-") and f[2] == "0x2" and f[3].lower() not in seen:
@@ -449,10 +451,13 @@ def parse_detail(text, now):
                 if not port or port.startswith("ath") or age is None or age > 300:
                     continue  # a Wi-Fi client that has left, or not heard from recently
             seen.add(mac)
+            iface = port or lan_port or f[5]
+            speed = lan_speed.get(iface)
             clients.append({
                 "mac": mac, "name": leases.get(mac, {}).get("host", ""), "ip": f[0],
-                "conn": "Wired · LAN port" if (port or "eth").startswith("eth") else f"Wired · {port}",
-                "iface": port or f[5], "wired": True})
+                "conn": "Wired · LAN port" if iface.startswith("eth") else f"Wired · {iface}",
+                "iface": iface, "wired": True,
+                "tx_rate": speed * 1000 if speed else None, "rx_rate": speed * 1000 if speed else None})
 
     # WAN uplinks
     portal = {}
@@ -702,6 +707,7 @@ class Collector(threading.Thread):
         self.seen = set()
         self.prev_clients = {}
         self.prev_procsnap = None
+        self.prev_port_net = None
         self.counted = {}       # (pid, start) -> ticks already attributed (or pre-window)
         self.tpoll = set()      # (pid, start) of processes seen spawning Teleport status commands
         self.last_detail = 0.0
@@ -924,18 +930,34 @@ class Collector(threading.Thread):
             series.update(self._cpu_accounting(now, proc_t, state["system"]["active_wan"]))
         except Exception as e:  # never let accounting break the rest of the detail poll
             log.warning("CPU accounting failed: %s", e)
+        # Wired clients: the router has no per-device counters, only per port. A port's
+        # tx is its clients' download. With several devices on one port the figures are shared.
+        pparts = proc_t.split(SEP)
+        port_net = parse_net(pparts[1]) if len(pparts) > 1 else {}
+        wired = collections.defaultdict(list)
+        for c in state["clients"]:
+            if c["wired"] and c["iface"] in port_net:
+                wired[c["iface"]].append(c)
+        for port, cs in wired.items():
+            rx, tx = port_net[port]
+            for c in cs:
+                c["tx_bytes"], c["rx_bytes"] = tx, rx
+                c["mac_key"] = port  # rate is tracked per port, not per device
+                if len(cs) > 1:
+                    c["shared"] = len(cs)
         # Per-client throughput from byte-counter deltas. The AP's tx is the client's download.
         current = {}
         for c in state["clients"]:
             if c.get("tx_bytes") is None:
                 continue
-            prev = self.prev_clients.get(c["mac"])
+            key = c.pop("mac_key", c["mac"])
+            prev = self.prev_clients.get(key)
             if prev and now > prev[0]:
                 d_down, d_up = c["tx_bytes"] - prev[1], c["rx_bytes"] - prev[2]
                 if d_down >= 0 and d_up >= 0:
                     c["down_bps"] = round(d_down / (now - prev[0]), 1)
                     c["up_bps"] = round(d_up / (now - prev[0]), 1)
-            current[c["mac"]] = (now, c["tx_bytes"], c["rx_bytes"])
+            current[key] = (now, c["tx_bytes"], c["rx_bytes"])
         self.prev_clients = current
         detail = dict(series, t=round(now, 3))
         new = sorted((e for e in events if e["id"] not in self.seen), key=lambda e: e["t"])
@@ -1111,7 +1133,7 @@ class DemoRunner:
                               {"wan_if": "ath5", "state": "open", "default_route": False},
                               {"wan_if": "usb0", "state": "unknown", "default_route": False}],
             "lldp_table": [{"local_port_name": "eth0", "chassis_descr": "Example Switch", "port_descr": "Port 7"}],
-            "lan_table": [{"interface": "eth1"}, {"interface": "ath0"}, {"interface": "ath1"}],
+            "lan_table": [{"interface": "eth1", "speed": 1000}, {"interface": "ath0"}, {"interface": "ath1"}],
             "vap_table": [
                 {"name": "ath0", "essid": "TravelNet", "radio": "ng", "channel": 6, "bw": 20, "num_sta": 0,
                  "tx_power": 11, "satisfaction": -1, "usage": "user", "up": True, "sta_table": []},
@@ -1154,7 +1176,10 @@ class DemoRunner:
             "9: ath5    inet 192.168.1.51/24 brd 192.168.1.255 scope global ath5\n"
             "10: br-lan    inet 192.168.29.1/24 brd 192.168.29.255 scope global br-lan",
             f"Inter-| sta-|\n face | tus |\n  ath5: 0005   44.  {-58 + int(r(-3, 3))}.  -96.   0 0 0 0 0 0",
-            f"{up}.00 1000.00\ndemo-boot\n6.6.122"]
+            f"{up}.00 1000.00\ndemo-boot\n6.6.122",
+            "port no\tmac addr\t\tis local?\tageing timer\n  1\taa:11:22:33:44:09\tno\t\t   0.20\n"
+            "  2\taa:11:22:33:44:01\tno\t\t   0.10",
+            "eth1 0x1\nath1 0x2"]
         return f"\n{SEP}\n".join(sections) + "\n" + PROC_SEP + "\n" + self._procs(up)
 
     def _procs(self, up):
@@ -1227,6 +1252,9 @@ button{cursor:pointer;padding:4px 10px}button:hover{border-color:var(--bad);colo
 .k{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
 main{display:grid;gap:14px;padding:0 16px 14px;grid-template-columns:repeat(auto-fit,minmax(min(420px,100%),1fr))}
 .wide{display:grid;gap:14px;padding:0 16px 16px}
+.sec{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:6px 16px 10px;
+ padding-bottom:6px;border-bottom:1px solid var(--grid)}
+main.netc{grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr))}
 @media (max-width:480px){main{grid-template-columns:1fr}}
 .card{background:var(--card);border:1px solid var(--grid);border-radius:10px;padding:12px 14px;min-width:0}
 .card h2{font-size:13px;margin:0 0 6px;font-weight:600;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -1265,7 +1293,8 @@ button.tgl{margin-left:auto;font-size:12px;font-weight:400;padding:2px 9px}butto
  <div class="card tile"><div class="k">Wi-Fi</div><div id="t-wifi"></div></div>
  <div class="card tile"><div class="k">Router</div><div id="t-sys"></div></div>
 </section>
-<main>
+<h2 class="sec">System</h2>
+<main class="sys">
  <div class="card cpu-card" id="cpucard"><h2>CPU <button id="cpumore" class="tgl" aria-expanded="false" aria-controls="cpucard">Show breakdown ▸</button></h2>
   <div class="cpu-grid">
    <div><div class="legend" id="lg-cpu"></div><canvas id="cpu"></canvas></div>
@@ -1273,6 +1302,13 @@ button.tgl{margin-left:auto;font-size:12px;font-weight:400;padding:2px 9px}butto
    <div class="cpu-more"><h3>By group <span class="muted" style="font-weight:400">· per detail poll</span></h3><div class="legend" id="lg-cpugrp"></div><canvas id="cpugrp"></canvas></div>
   </div></div>
  <div class="card"><h2>Memory</h2><div class="legend" id="lg-mem"></div><canvas id="mem"></canvas></div>
+  <div class="card"><h2>Teleport CPU cost <span class="chip">estimate</span></h2><canvas id="tcost" style="height:220px"></canvas><div id="tcost-txt" style="margin-top:8px"></div></div>
+</main>
+<section class="wide">
+ <div class="card"><h2>Top processes</h2><div class="tw" id="procs"></div></div>
+</section>
+<h2 class="sec">Network</h2>
+<main class="netc">
  <div class="card"><h2>Throughput <select id="iface"></select></h2><div class="legend" id="lg-net"></div><canvas id="net"></canvas></div>
  <div class="card"><h2>WAN latency</h2><div class="legend" id="lg-lat"></div><canvas id="lat"></canvas></div>
  <div class="card"><h2>Channel utilisation</h2><div class="legend" id="lg-cu"></div><canvas id="cu"></canvas></div>
@@ -1288,10 +1324,6 @@ button.tgl{margin-left:auto;font-size:12px;font-weight:400;padding:2px 9px}butto
  <div class="two">
   <div class="card"><h2>Wi-Fi networks</h2><div class="tw" id="vaps"></div></div>
   <div class="card"><h2>Radios</h2><div class="tw" id="radios"></div></div>
- </div>
- <div class="two">
-  <div class="card"><h2>Teleport CPU cost <span class="chip">estimate</span></h2><canvas id="tcost" style="height:220px"></canvas><div id="tcost-txt" style="margin-top:8px"></div></div>
-  <div class="card"><h2>Top processes</h2><div class="tw" id="procs"></div></div>
  </div>
  <div class="card"><h2>Nearby networks</h2><div class="tw" id="nbrs"></div></div>
  <div class="card"><h2>Events
@@ -1507,8 +1539,10 @@ function renderInfo(){
   $('ncl').textContent=`${nw} Wi-Fi · ${st.clients.length-nw} wired`;
   table('clients',['Name','IP','Connection','#Signal','#Link ↓ / ↑','#Now ↓ / ↑','#Total ↓ / ↑','Standard','#Connected','#Experience'],cl.map(c=>[
    c.name?esc(c.name):`<span class="muted">${esc(c.mac)}</span>`,esc(c.ip||'–'),esc(c.conn),c.wired?'–':sig(c.signal),
-   c.wired?'–':`${fmtLink(c.tx_rate)} / ${fmtLink(c.rx_rate)}`,c.down_bps!=null?`${fmtBits(c.down_bps)} / ${fmtBits(c.up_bps)}`:'–',
-   c.tx_bytes!=null?`${fmtBytes(c.tx_bytes)} / ${fmtBytes(c.rx_bytes)}`:'–',esc(c.std||'–'),fmtDur(c.uptime),exp(c.satisfaction)]),
+   c.wired?(c.tx_rate?fmtLink(c.tx_rate):'–'):`${fmtLink(c.tx_rate)} / ${fmtLink(c.rx_rate)}`,
+   (c.down_bps!=null?`${fmtBits(c.down_bps)} / ${fmtBits(c.up_bps)}`:'–')+(c.shared?`<div class="muted" style="font-size:11.5px">port total, shared by ${c.shared}</div>`:''),
+   (c.tx_bytes!=null?`${fmtBytes(c.tx_bytes)} / ${fmtBytes(c.rx_bytes)}`:'–')+(c.wired&&c.tx_bytes!=null?`<div class="muted" style="font-size:11.5px">port since boot</div>`:''),
+   esc(c.std||(c.wired?'Ethernet':'–')),fmtDur(c.uptime),exp(c.satisfaction)]),
    {empty:'No clients connected'});
 
   table('vaps',['Network','Role','Band','#Channel','#Clients','#Tx power','#Experience'],st.vaps.map(v=>[esc(v.essid||'(hidden)'),
