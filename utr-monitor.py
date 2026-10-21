@@ -9,6 +9,7 @@ Usage:
     python3 utr_monitor.py 192.168.1.1 -i 2 --port 8080
     UTR_PASSWORD=secret python3 utr_monitor.py 192.168.1.1
     python3 utr_monitor.py --demo                      # fake data, no device needed
+    python3 utr_monitor.py 192.168.1.1 --no-db         # memory only, no SQLite
  
 Then open http://127.0.0.1:8080/
  
@@ -29,6 +30,7 @@ import math
 import os
 import random
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -233,15 +235,87 @@ def parse_top(text):
 # --------------------------------------------------------------------------- #
 # Collector
 # --------------------------------------------------------------------------- #
+class Store:
+    """SQLite persistence: one row per poll, interface rates stored as JSON."""
+
+    COLS = ("t", "cpu", "mem_pct", "mem_used_mb", "mem_total_mb", "load1")
+
+    def __init__(self, path, retention_days=0):
+        self.path = path
+        self.retention = float(retention_days or 0) * 86400
+        self.lock = threading.Lock()
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS samples (
+            t REAL PRIMARY KEY, cpu REAL, mem_pct REAL, mem_used_mb REAL,
+            mem_total_mb REAL, load1 REAL, net TEXT NOT NULL DEFAULT '{}')""")
+        self.db.commit()
+        self.count = self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+        self._last_prune = 0.0
+        self._prune()
+
+    def _prune(self):
+        if not self.retention:
+            return
+        cur = self.db.execute("DELETE FROM samples WHERE t < ?", (time.time() - self.retention,))
+        self.db.commit()
+        self.count -= max(cur.rowcount, 0)
+        self._last_prune = time.time()
+
+    def _row(self, r):
+        d = dict(zip(self.COLS, r[:6]))
+        d["net"] = json.loads(r[6] or "{}")
+        return d
+
+    def add(self, s):
+        with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?)",
+                            [s[c] for c in self.COLS] + [json.dumps(s["net"], separators=(",", ":"))])
+            self.db.commit()
+            self.count += 1
+            if self.retention and time.time() - self._last_prune > 600:
+                self._prune()
+
+    def recent(self, limit):
+        with self.lock:
+            rows = self.db.execute("SELECT * FROM (SELECT * FROM samples ORDER BY t DESC LIMIT ?) "
+                                   "ORDER BY t", (limit,)).fetchall()
+        return [self._row(r) for r in rows]
+
+    def iter_all(self):
+        conn = sqlite3.connect(self.path)  # separate reader; WAL lets it run alongside writes
+        try:
+            for r in conn.execute("SELECT * FROM samples ORDER BY t"):
+                yield self._row(r)
+        finally:
+            conn.close()
+
+    def reset(self):
+        with self.lock:
+            self.db.execute("DELETE FROM samples")
+            self.db.commit()
+            self.db.execute("VACUUM")
+            self.count = 0
+
+    def close(self):
+        with self.lock:
+            self.db.close()
+
+
 class Collector(threading.Thread):
-    def __init__(self, runner, interval, history, iface_filter=None):
+    def __init__(self, runner, interval, history, iface_filter=None, store=None):
         super().__init__(daemon=True)
         self.runner, self.interval = runner, interval
         self.samples = collections.deque(maxlen=history)
         self.iface_filter = set(iface_filter or [])
         self.lock = threading.Lock()
         self.status = {"connected": False, "error": None, "method": None,
-                       "uptime": "", "host": getattr(runner, "host", "demo")}
+                       "uptime": "", "host": getattr(runner, "host", "demo"),
+                       "db": store.path if store else None, "db_rows": 0, "reset_gen": 0}
+        self.store = store
+        if store:
+            self.samples.extend(store.recent(history))
+            log.info("Loaded %d samples from %s", len(self.samples), store.path)
         self.method = None
         self.prev_cpu = None
         self.prev_net = None
@@ -323,6 +397,11 @@ class Collector(threading.Thread):
                 with self.lock:
                     if self.warm:  # first poll only primes the delta counters
                         self.samples.append(s)
+                        if self.store:
+                            try:
+                                self.store.add(s)
+                            except Exception as e:
+                                log.warning("DB write failed: %s", e)
                     self.warm = True
                     self.status.update(connected=True, error=None)
                 backoff = 2
@@ -342,10 +421,20 @@ class Collector(threading.Thread):
                 continue
             time.sleep(max(0.0, self.interval - (time.time() - start)))
  
+    def reset(self):
+        with self.lock:
+            self.samples.clear()
+            if self.store:
+                self.store.reset()
+            self.status["reset_gen"] += 1
+        log.info("History reset from web UI")
+
     def snapshot(self, since=0.0):
         with self.lock:
             data = [s for s in self.samples if s["t"] > since]
-            return {"status": dict(self.status), "interval": self.interval,
+            st = dict(self.status)
+            st["db_rows"] = self.store.count if self.store else 0
+            return {"status": st, "interval": self.interval,
                     "history": self.samples.maxlen, "samples": data}
  
  
@@ -400,6 +489,7 @@ h1{font-size:17px;margin:0;font-weight:600}.muted{color:var(--muted)}
 .dot{width:9px;height:9px;border-radius:50%;display:inline-block;background:var(--muted);margin-right:6px}
 .spacer{flex:1}select{background:var(--card);color:var(--fg);border:1px solid var(--grid);
  border-radius:6px;padding:4px 8px;font:inherit}
+button{background:var(--card);color:var(--fg);border:1px solid var(--grid);border-radius:6px;padding:4px 10px;font:inherit;cursor:pointer}button:hover{border-color:var(--bad);color:var(--bad)}
 main{display:grid;gap:14px;padding:0 16px 16px;grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
 @media (max-width:480px){main{grid-template-columns:1fr}}
 .card{background:var(--card);border:1px solid var(--grid);border-radius:10px;padding:12px 14px}
@@ -415,10 +505,11 @@ th{color:var(--muted);font-weight:500}tr.sel td{color:var(--c1);font-weight:600}
 <header>
  <h1>UTR Monitor</h1><span id="host" class="muted"></span>
  <span><span id="dot" class="dot"></span><span id="st" class="muted">connecting…</span></span>
- <span id="up" class="muted"></span><span class="spacer"></span>
+ <span id="up" class="muted"></span><span id="db" class="muted"></span><span class="spacer"></span>
  <label class="muted">Window <select id="win">
   <option value="300">5 min</option><option value="900" selected>15 min</option>
   <option value="3600">1 hour</option><option value="0">All</option></select></label>
+ <button id="reset" title="Delete all collected history">Reset data</button>
 </header>
 <main>
  <div class="card"><h2>CPU</h2><div class="legend" id="lg-cpu"></div><canvas id="cpu"></canvas></div>
@@ -455,11 +546,14 @@ function draw(id,times,series,opt){
   ctx.fillText(opt.fmt(v),P.l-6,y)}
  ctx.textAlign='center';ctx.textBaseline='top';
  const n=Math.max(2,Math.floor(pw/90));for(let i=0;i<=n;i++){const t=t0+(t1-t0)*i/n;ctx.fillText(tstr(t),Math.min(Math.max(X(t),P.l+22),W-P.r-22),P.t+ph+5)}
- series.forEach((s,si)=>{const col=css(s.color);ctx.strokeStyle=col;ctx.lineWidth=1.6;ctx.beginPath();let pen=false,first=null,lastx=null;
-  times.forEach((t,i)=>{const v=s.values[i];if(v==null){pen=false;return}const x=X(t),y=Y(Math.min(v,mx));
-   if(!pen){ctx.moveTo(x,y);pen=true;if(first==null)first=x}else ctx.lineTo(x,y);lastx=x});ctx.stroke();
-  if(si===0&&opt.fill&&first!=null){ctx.lineTo(lastx,P.t+ph);ctx.lineTo(first,P.t+ph);ctx.closePath();
-   ctx.globalAlpha=.12;ctx.fillStyle=col;ctx.fill();ctx.globalAlpha=1}});
+ const gap=Math.max(3*S.interval,5); // break lines across collection gaps (e.g. restarts)
+ series.forEach((s,si)=>{const col=css(s.color),segs=[];let cur=null;
+  times.forEach((t,i)=>{const v=s.values[i];if(v==null||(i&&t-times[i-1]>gap))cur=null;if(v==null)return;
+   if(!cur)segs.push(cur=[]);cur.push([X(t),Y(Math.min(v,mx))])});
+  for(const g of segs){ctx.beginPath();g.forEach(([x,y],k)=>k?ctx.lineTo(x,y):ctx.moveTo(x,y));
+   ctx.strokeStyle=col;ctx.lineWidth=1.6;ctx.stroke();
+   if(si===0&&opt.fill){ctx.lineTo(g[g.length-1][0],P.t+ph);ctx.lineTo(g[0][0],P.t+ph);ctx.closePath();
+    ctx.globalAlpha=.12;ctx.fillStyle=col;ctx.fill();ctx.globalAlpha=1}}});
  c._geo={P,pw,t0,t1,times};
  const h=S.hover[id];if(h!=null&&times[h]!=null){const x=Math.round(X(times[h]))+.5;ctx.strokeStyle=css('--muted');
   ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(x,P.t);ctx.lineTo(x,P.t+ph);ctx.stroke();ctx.setLineDash([]);
@@ -495,12 +589,14 @@ function render(){
 async function poll(){
  try{const r=await fetch('/api/data?since='+S.last),j=await r.json();
   S.interval=j.interval;S.history=j.history;
+  if(S.gen!=null&&j.status.reset_gen!==S.gen){S.samples=[];S.iface=null}S.gen=j.status.reset_gen;S.db=j.status.db;
   if(j.samples.length){S.samples.push(...j.samples);S.last=j.samples[j.samples.length-1].t;
    if(S.samples.length>S.history)S.samples.splice(0,S.samples.length-S.history)}
   const st=j.status;$('host').textContent=st.host+(st.method?` · via ${st.method}`:'');
   $('dot').style.background=css(st.connected?'--ok':'--bad');
   $('st').textContent=st.connected?'live':(st.error?'error: '+st.error:'connecting…');
-  $('up').textContent=st.uptime||'';render();
+  $('up').textContent=st.uptime||'';
+  $('db').textContent=st.db?`· db ${st.db} (${st.db_rows.toLocaleString()} rows)`:'· db off';render();
  }catch(e){$('dot').style.background=css('--bad');$('st').textContent='web server unreachable'}
  setTimeout(poll,Math.max(1000,S.interval*1000));
 }
@@ -511,6 +607,10 @@ for(const id of['cpu','mem','net']){const c=$(id);
  c.addEventListener('mouseleave',()=>{S.hover={};render()})}
 $('iface').onchange=e=>{S.iface=e.target.value;render()};
 $('tbl').onclick=e=>{const tr=e.target.closest('tr');if(tr){S.iface=tr.dataset.i;render()}};
+$('reset').onclick=async()=>{
+ if(!confirm('Delete all collected history'+(S.db?' (including the SQLite database)':'')+'? This cannot be undone.'))return;
+ const r=await fetch('/api/reset',{method:'POST',headers:{'X-UTR-Reset':'1'}});
+ if(r.ok){S.samples=[];S.last=0;S.iface=null;render()}else alert('Reset failed: '+r.status)};
 $('win').onchange=render;window.addEventListener('resize',render);
 poll();
 </script></body></html>"""
@@ -530,6 +630,41 @@ def make_handler(collector):
             self.end_headers()
             self.wfile.write(data)
  
+        def _csv(self):
+            store = collector.store
+            src = store.iter_all if store else (lambda: iter(collector.snapshot()["samples"]))
+            ifaces = sorted({k for s in src() for k in s["net"]})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv")
+            self.send_header("Content-Disposition", 'attachment; filename="utr-monitor.csv"')
+            self.end_headers()
+
+            def cell(v):
+                return "" if v is None else str(v)
+            out = ["time,cpu_pct,mem_pct,mem_used_mb,load1" +
+                   "".join(f",{i}_rx_bps,{i}_tx_bps" for i in ifaces)]
+            for s in src():
+                row = [time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(s["t"])),
+                       cell(s["cpu"]), cell(s["mem_pct"]), cell(s["mem_used_mb"]), cell(s["load1"])]
+                for i in ifaces:
+                    rx, tx = s["net"].get(i, (None, None))
+                    row += ["" if rx is None else f"{rx * 8:.0f}", "" if tx is None else f"{tx * 8:.0f}"]
+                out.append(",".join(row))
+                if len(out) >= 5000:
+                    self.wfile.write(("\n".join(out) + "\n").encode())
+                    out = []
+            if out:
+                self.wfile.write(("\n".join(out) + "\n").encode())
+
+        def do_POST(self):
+            if urlparse(self.path).path != "/api/reset":
+                return self._send(404, "not found", "text/plain")
+            # A custom header forces a CORS preflight, so other websites can't trigger a reset.
+            if self.headers.get("X-UTR-Reset") != "1":
+                return self._send(403, "missing X-UTR-Reset header", "text/plain")
+            collector.reset()
+            self._send(200, '{"ok": true}', "application/json")
+
         def do_GET(self):
             u = urlparse(self.path)
             if u.path in ("/", "/index.html"):
@@ -541,20 +676,7 @@ def make_handler(collector):
                     since = 0.0
                 self._send(200, json.dumps(collector.snapshot(since)), "application/json")
             elif u.path == "/api/export.csv":
-                snap = collector.snapshot()
-                ifaces = sorted({k for s in snap["samples"] for k in s["net"]})
-                rows = ["time,cpu_pct,mem_pct,mem_used_mb,load1," +
-                        ",".join(f"{i}_rx_bps,{i}_tx_bps" for i in ifaces)]
-                for s in snap["samples"]:
-                    net = ",".join(
-                        f"{s['net'][i][0] * 8:.0f},{s['net'][i][1] * 8:.0f}" if i in s["net"] else ","
-                        for i in ifaces)
-                    rows.append(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s['t']))},"
-                                f"{s['cpu'] if s['cpu'] is not None else ''},"
-                                f"{s['mem_pct'] if s['mem_pct'] is not None else ''},"
-                                f"{s['mem_used_mb'] if s['mem_used_mb'] is not None else ''},"
-                                f"{s['load1'] if s['load1'] is not None else ''},{net}")
-                self._send(200, "\n".join(rows) + "\n", "text/csv")
+                self._csv()
             else:
                 self._send(404, "not found", "text/plain")
  
@@ -572,6 +694,10 @@ def main():
     ap.add_argument("--iface", action="append", help="only track this interface (repeatable)")
     ap.add_argument("--bind", default="127.0.0.1", help="web server bind address (default 127.0.0.1)")
     ap.add_argument("--port", type=int, default=8080, help="web server port (default 8080)")
+    ap.add_argument("--db", help="SQLite file (default: utr-monitor-<host>.db in the current directory)")
+    ap.add_argument("--no-db", action="store_true", help="don't persist samples to SQLite")
+    ap.add_argument("--retention-days", type=float, default=30,
+                    help="prune DB rows older than this many days (0 = keep forever; default 30)")
     ap.add_argument("--demo", action="store_true", help="generate fake data, no SSH")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
@@ -589,7 +715,17 @@ def main():
         pw = a.password or os.environ.get("UTR_PASSWORD") or getpass.getpass(f"Password for {a.user}@{a.host}: ")
         runner = SSHRunner(a.host, a.user, pw, port=a.ssh_port)
  
-    col = Collector(runner, max(0.5, a.interval), a.history, a.iface)
+    db_path = None
+    if not a.no_db:
+        if a.db:
+            db_path = a.db
+        elif not a.demo:  # keep fake data out of the real DB unless --db is given
+            db_path = "utr-monitor-" + re.sub(r"[^A-Za-z0-9._-]", "_", a.host) + ".db"
+    store = Store(db_path, a.retention_days) if db_path else None
+    if store:
+        log.info("Persisting to %s (%d rows, retention %s)", db_path, store.count,
+                 f"{a.retention_days:g} days" if a.retention_days else "forever")
+    col = Collector(runner, max(0.5, a.interval), a.history, a.iface, store)
     col.start()
  
     srv = ThreadingHTTPServer((a.bind, a.port), make_handler(col))
@@ -602,6 +738,8 @@ def main():
     finally:
         srv.server_close()
         runner.close()
+        if store:
+            store.close()
  
  
 if __name__ == "__main__":

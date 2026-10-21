@@ -15,7 +15,8 @@ seconds and serves a local web page with live charts.
 - Hover crosshair on all charts; 5 min / 15 min / 1 hour / all-history windows
 - Self-contained page: no CDN or internet access needed, so it works when you're
   only connected to the travel router
-- CSV export of everything collected so far
+- History saved to SQLite by default, reloaded on restart, and a **Reset data** button in the UI to clear it
+- CSV export of the full history
 - Automatic reconnect with backoff if the SSH session drops
 - `--demo` mode with synthetic data for trying the UI without a device
 
@@ -67,6 +68,9 @@ python3 utr-monitor.py --demo
 | `--iface NAME` | all except `lo` | Track only this interface; repeat for more |
 | `--bind` | `127.0.0.1` | Web server bind address; use `0.0.0.0` for LAN access |
 | `--port` | `8080` | Web server port |
+| `--db PATH` | `utr-monitor-<host>.db` | SQLite file for history, in the current directory |
+| `--no-db` | off | Don't persist; keep history in memory only |
+| `--retention-days` | `30` | Delete DB rows older than this; `0` keeps everything |
 | `--demo` | off | Generate fake data instead of connecting |
 | `-v`, `--verbose` | off | Debug logging |
 
@@ -76,7 +80,8 @@ python3 utr-monitor.py --demo
 |---|---|
 | `/` | The dashboard |
 | `/api/data?since=<epoch>` | JSON: connection status and samples newer than `since` |
-| `/api/export.csv` | All samples as CSV (throughput in bits/s) |
+| `/api/export.csv` | Full history as CSV (from the DB when enabled; throughput in bits/s) |
+| `POST /api/reset` | Clears in-memory and DB history (needs header `X-UTR-Reset: 1`; the UI button sends it) |
 
 ## How it works
 
@@ -97,15 +102,31 @@ command's output with unique markers.
 
 The page header shows which method is in use and whether the connection is live.
 
+### Persistence
+
+Each sample is written to a SQLite `samples` table (WAL mode), with interface
+rates stored as a JSON column. By default the file is named after the host, so
+monitoring different routers keeps their history separate. On startup the most
+recent `--history` samples are loaded back into the charts, and lines break
+across gaps such as restarts rather than joining them up.
+
+`--demo` doesn't write to a DB unless you pass `--db`, so fake data never ends
+up mixed with real history.
+
+**Reset data** asks for confirmation, then deletes all rows and compacts the
+file. Other open browser tabs pick up the reset on their next poll.
+
 ## Caveats
 
-- Data is held in memory only and is lost when the script stops. Use the CSV
-  export if you want to keep it.
+- With `--no-db`, history lives in memory only and is lost when the script stops.
+- The charts show at most the last `--history` samples. Older rows stay in the
+  DB (up to the retention limit) and are included in the CSV export.
+- At the default 2 s interval the DB grows by roughly 43,000 rows a day, a few MB.
 - With the `top` fallback, some BusyBox builds report CPU averaged since boot
   rather than the current value. Run with `-v` to see what's being collected.
 - Host keys are accepted automatically (`AutoAddPolicy`), since travel routers
   are often reset or re-adopted. Don't use this on a network you don't trust.
-- The web server has no authentication. Keep the default `127.0.0.1` bind
-  unless you need LAN access.
+- The web server has no authentication, and anyone who can reach it can reset
+  the history. Keep the default `127.0.0.1` bind unless you need LAN access.
 - Interface counters that reset or wrap are skipped for that sample rather than
   shown as a spike.

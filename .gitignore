@@ -4,3 +4,8 @@ my-venv/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Local SQLite history
+*.db
+*.db-wal
+*.db-shm
