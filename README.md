@@ -42,6 +42,8 @@ firmware exposes.
 - **Events:** the router's `utr-runtime-events.log` (internet up/down, Wi-Fi
   uplink, DHCP, VPN, USB tether, Bluetooth) as a filterable timeline, with
   markers on the charts
+- Two themes, switchable from the header and remembered per browser: **Classic** (default)
+  and **UniFi style**, a network-console look. Both follow the system light/dark setting
 - Self-contained page: no CDN or internet access needed, so it works when you're
   only connected to the travel router
 - History saved to SQLite by default, reloaded on restart, and a **Reset data** button in the UI to clear it

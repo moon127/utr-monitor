@@ -1233,6 +1233,7 @@ PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>UTR Monitor</title>
+<script>try{document.documentElement.dataset.skin=localStorage.getItem('utr.skin')||'classic'}catch(e){document.documentElement.dataset.skin='classic'}</script>
 <style>
 :root{--bg:#f6f7f9;--card:#fff;--fg:#1d2330;--muted:#6b7280;--grid:#e5e7eb;--chip:#eef1f5;
  --c1:#2563eb;--c2:#d97706;--c3:#059669;--c4:#7c3aed;--c5:#db2777;--bad:#dc2626;--ok:#16a34a;--warn:#d97706}
@@ -1255,6 +1256,33 @@ main{display:grid;gap:14px;padding:0 16px 14px;grid-template-columns:repeat(auto
 .sec{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:6px 16px 10px;
  padding-bottom:6px;border-bottom:1px solid var(--grid)}
 main.netc{grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr))}
+/* ---- "UniFi style" theme: same layout, network-console look ---- */
+:root[data-skin=unifi]{--bg:#f4f5f6;--card:#fff;--fg:#212327;--muted:#7d8590;--grid:#e9ebed;--chip:#eef0f2;--head:#f8f9fa;
+ --accent:#006fff;--c1:#006fff;--c2:#f5a524;--c3:#17b26a;--c4:#7a5af8;--c5:#ee46bc;--bad:#f04438;--ok:#17b26a;--warn:#f79009}
+@media (prefers-color-scheme:dark){:root[data-skin=unifi]{--bg:#121315;--card:#1b1d20;--fg:#e8e9eb;--muted:#8b919a;--grid:#2a2d31;
+ --chip:#25282c;--head:#202327;--accent:#4797ff;--c1:#4797ff;--c2:#fdb022;--c3:#32d583;--c4:#9b8afb;--c5:#f670c7;
+ --bad:#f97066;--ok:#32d583;--warn:#fdb022}}
+:root[data-skin=unifi] body{font-size:13px}
+:root[data-skin=unifi] header{background:var(--card);border-bottom:1px solid var(--grid);padding:10px 20px;margin-bottom:18px;
+ position:sticky;top:0;z-index:5}
+:root[data-skin=unifi] h1{font-size:15px;display:flex;align-items:center;gap:8px}
+:root[data-skin=unifi] h1::before{content:"";width:18px;height:18px;border-radius:5px;background:var(--accent);
+ box-shadow:inset 0 0 0 5px color-mix(in srgb,var(--accent) 70%,#fff)}
+:root[data-skin=unifi] .tiles,:root[data-skin=unifi] main,:root[data-skin=unifi] .wide{padding-left:20px;padding-right:20px;gap:16px}
+:root[data-skin=unifi] .card{border-radius:8px;padding:14px 16px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+:root[data-skin=unifi] .card h2{font-size:14px;margin-bottom:10px}
+:root[data-skin=unifi] .sec{text-transform:none;letter-spacing:0;font-size:17px;color:var(--fg);border:0;margin:14px 20px 10px;padding:0}
+:root[data-skin=unifi] .k{text-transform:none;letter-spacing:0;font-size:12.5px;font-weight:500}
+:root[data-skin=unifi] .tile{border-top:3px solid var(--accent);padding-top:12px}
+:root[data-skin=unifi] .tile .v{font-size:20px;margin-top:4px}
+:root[data-skin=unifi] th{background:var(--head);font-size:12px;font-weight:600;padding:8px 10px}
+:root[data-skin=unifi] td{padding:8px 10px}
+:root[data-skin=unifi] tbody tr:hover td{background:var(--head)}
+:root[data-skin=unifi] .chip{border-radius:4px;font-weight:500;padding:1px 8px}
+:root[data-skin=unifi] select,:root[data-skin=unifi] button{border-radius:6px;padding:5px 10px}
+:root[data-skin=unifi] button.tgl{color:var(--accent);background:transparent;border-color:transparent;font-weight:500}
+:root[data-skin=unifi] button.tgl:hover{background:var(--head);border-color:var(--grid)}
+:root[data-skin=unifi] tr.sel td{color:var(--accent)}
 @media (max-width:480px){main{grid-template-columns:1fr}}
 .card{background:var(--card);border:1px solid var(--grid);border-radius:10px;padding:12px 14px;min-width:0}
 .card h2{font-size:13px;margin:0 0 6px;font-weight:600;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -1285,6 +1313,7 @@ button.tgl{margin-left:auto;font-size:12px;font-weight:400;padding:2px 9px}butto
  <label class="muted">Window <select id="win">
   <option value="300">5 min</option><option value="900" selected>15 min</option>
   <option value="3600">1 hour</option><option value="21600">6 hours</option><option value="0">All</option></select></label>
+ <label class="muted">Theme <select id="skin"><option value="classic">Classic</option><option value="unifi">UniFi style</option></select></label>
  <button id="reset" title="Delete all collected history">Reset data</button>
 </header>
 <section class="tiles">
@@ -1636,6 +1665,11 @@ $('reset').onclick=async()=>{
  const r=await fetch('/api/reset',{method:'POST',headers:{'X-UTR-Reset':'1'}});
  if(r.ok){S.samples=[];S.details=[];S.events=[];S.last=S.dlast=0;S.iface=null;renderInfo();renderCharts()}else alert('Reset failed: '+r.status)};
 $('win').onchange=()=>{renderInfo();renderCharts()};window.addEventListener('resize',renderCharts);
+$('skin').value=document.documentElement.dataset.skin||'classic';
+$('skin').onchange=e=>{document.documentElement.dataset.skin=e.target.value;
+ try{localStorage.setItem('utr.skin',e.target.value)}catch(err){}
+ const st=S.last&&document.getElementById('dot');renderInfo();renderCharts();
+ if(st)st.style.background=css(($('st').textContent||'').startsWith('live')?'--ok':'--bad')};
 function setCpu(open){$('cpucard').classList.toggle('open',open);const b=$('cpumore');
  b.textContent=open?'Hide breakdown ▾':'Show breakdown ▸';b.setAttribute('aria-expanded',String(open));
  try{localStorage.setItem('utr.cpuBreakdown',open?'1':'0')}catch(e){}
