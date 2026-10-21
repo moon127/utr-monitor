@@ -1227,6 +1227,96 @@ class DemoRunner:
 
 
 # --------------------------------------------------------------------------- #
+# Saved password (system keychain via the optional `keyring` package)
+# --------------------------------------------------------------------------- #
+KEYRING_SERVICE = "utr-monitor"
+
+
+def _keyring():
+    try:
+        import keyring
+        keyring.get_keyring()
+        return keyring
+    except Exception:
+        return None
+
+
+def stored_password(user, host):
+    kr = _keyring()
+    if not kr:
+        return None
+    try:
+        return kr.get_password(KEYRING_SERVICE, f"{user}@{host}")
+    except Exception as e:
+        log.debug("keyring read failed: %s", e)
+        return None
+
+
+def save_password(user, host, password):
+    kr = _keyring()
+    if not kr:
+        return False
+    try:
+        kr.set_password(KEYRING_SERVICE, f"{user}@{host}", password)
+        return True
+    except Exception as e:
+        log.warning("Couldn't save the password to the keychain: %s", e)
+        return False
+
+
+def forget_password(user, host):
+    kr = _keyring()
+    if not kr:
+        return False
+    try:
+        kr.delete_password(KEYRING_SERVICE, f"{user}@{host}")
+        return True
+    except Exception:
+        return False
+
+
+def resolve_password(user, host, password=None):
+    """Return (password, source): --password, $UTR_PASSWORD, the keychain, or a prompt."""
+    if password:
+        return password, "argument"
+    if os.environ.get("UTR_PASSWORD"):
+        return os.environ["UTR_PASSWORD"], "environment"
+    saved = stored_password(user, host)
+    if saved:
+        return saved, "keychain"
+    return getpass.getpass(f"Password for {user}@{host}: "), "prompt"
+
+
+def login(runner, source, save=True):
+    """Check the password before starting. A rejected saved password is removed and
+    you're asked again; a password you typed is saved once it works. If the router
+    can't be reached yet, carry on and let the collector keep retrying."""
+    import paramiko
+    for attempt in range(3):
+        try:
+            runner.connect()
+            break
+        except paramiko.AuthenticationException:
+            if source == "keychain":
+                log.warning("The saved password for %s@%s was rejected; removing it", runner.user, runner.host)
+                forget_password(runner.user, runner.host)
+            elif source != "prompt":
+                sys.exit(f"SSH login to {runner.user}@{runner.host} failed: password rejected")
+            if attempt == 2:
+                sys.exit(f"SSH login to {runner.user}@{runner.host} failed after 3 attempts")
+            runner.password = getpass.getpass(f"Password rejected. Password for {runner.user}@{runner.host}: ")
+            source = "prompt"
+        except Exception as e:
+            log.warning("Can't reach %s yet (%s); will keep retrying", runner.host, e)
+            return
+    if source == "prompt" and save:
+        if save_password(runner.user, runner.host, runner.password):
+            log.info("Password saved to the system keychain (remove it with --forget-password)")
+        else:
+            log.info("To remember the password between runs: pip install keyring")
+
+
+# --------------------------------------------------------------------------- #
 # Web UI
 # --------------------------------------------------------------------------- #
 PAGE = r"""<!doctype html>
@@ -1758,7 +1848,11 @@ def main():
     ap = argparse.ArgumentParser(description="Graph a UniFi Travel Router's CPU/MEM/network via SSH.")
     ap.add_argument("host", nargs="?", help="UTR IP address / hostname")
     ap.add_argument("-u", "--user", default="ui", help="SSH user (default: ui)")
-    ap.add_argument("-p", "--password", help="SSH password (else $UTR_PASSWORD, else prompt)")
+    ap.add_argument("-p", "--password", help="SSH password (else $UTR_PASSWORD, else the saved one, else prompt)")
+    ap.add_argument("--no-save-password", action="store_true",
+                    help="don't save a typed password to the system keychain")
+    ap.add_argument("--forget-password", action="store_true",
+                    help="remove the saved password for this user@host and exit")
     ap.add_argument("--ssh-port", type=int, default=22)
     ap.add_argument("-i", "--interval", type=float, default=2.0, help="poll interval seconds (default 2)")
     ap.add_argument("--detail-interval", type=float, default=10.0,
@@ -1788,8 +1882,16 @@ def main():
     else:
         if not a.host:
             ap.error("host is required (or use --demo)")
-        pw = a.password or os.environ.get("UTR_PASSWORD") or getpass.getpass(f"Password for {a.user}@{a.host}: ")
+        if a.forget_password:
+            if forget_password(a.user, a.host):
+                print(f"Removed the saved password for {a.user}@{a.host}")
+            else:
+                print(f"No saved password for {a.user}@{a.host}" +
+                      ("" if _keyring() else " (the keyring package isn't installed)"))
+            return
+        pw, source = resolve_password(a.user, a.host, a.password)
         runner = SSHRunner(a.host, a.user, pw, port=a.ssh_port, timeout=20)
+        login(runner, source, save=not a.no_save_password)
 
     if a.once:
         col = Collector(runner, 1, 10)

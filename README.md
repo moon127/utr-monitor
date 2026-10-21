@@ -55,6 +55,7 @@ firmware exposes.
 
 - Python 3.8+
 - [paramiko](https://www.paramiko.org/)
+- Optional: [keyring](https://pypi.org/project/keyring/), to remember the SSH password in the system keychain
 - SSH enabled on the UTR, and the device SSH password (user `ui` by default)
 
 ## Setup
@@ -62,7 +63,7 @@ firmware exposes.
 ```bash
 python3 -m venv my-venv
 source my-venv/bin/activate
-pip install paramiko
+pip install paramiko keyring
 ```
 
 ## Usage
@@ -80,6 +81,29 @@ UTR_PASSWORD='secret' python3 utr-monitor.py 192.168.1.1
 python3 utr-monitor.py 192.168.1.1 -p 'secret'   # visible in shell history / ps
 ```
 
+### Saved password
+
+With `keyring` installed, the password you type is saved to the system
+keychain (macOS Keychain, Windows Credential Manager, or the Secret Service on
+Linux) once the login succeeds. Later runs, and `utr-probe.py`, use it without
+asking. It's stored per `user@host`, under the service name `utr-monitor`.
+
+It's stored encrypted by the OS rather than hashed: SSH needs the real password
+each time, so a one-way hash couldn't be used to log in.
+
+If the router's password changes, the monitor notices the saved one being
+rejected, removes it and asks again. To reset it yourself:
+
+```bash
+python3 utr-monitor.py 192.168.1.1 --forget-password
+# or, on macOS:
+security delete-generic-password -s utr-monitor -a ui@192.168.1.1
+```
+
+You can also open **Keychain Access**, search for `utr-monitor` and delete the
+entry. `--no-save-password` stops a typed password from being saved.
+`--password` and `$UTR_PASSWORD` take priority and are never saved.
+
 Try the UI without a router:
 
 ```bash
@@ -92,8 +116,10 @@ python3 utr-monitor.py --demo
 |---|---|---|
 | `host` | – | UTR IP address or hostname (not needed with `--demo`) |
 | `-u`, `--user` | `ui` | SSH username |
-| `-p`, `--password` | – | SSH password (else `$UTR_PASSWORD`, else prompt) |
+| `-p`, `--password` | – | SSH password (else `$UTR_PASSWORD`, else the saved one, else prompt) |
 | `--ssh-port` | `22` | SSH port |
+| `--no-save-password` | off | Don't save a typed password to the keychain |
+| `--forget-password` | – | Remove the saved password for `user@host` and exit |
 | `-i`, `--interval` | `2` | Fast poll interval in seconds (minimum 0.5) |
 | `--detail-interval` | `10` | Seconds between UniFi detail polls (minimum 5); `0` turns them off |
 | `--history` | `3600` | Points kept in memory per series (≈ 2 h of fast samples, 10 h of detail) |

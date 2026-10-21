@@ -13,7 +13,6 @@ Usage:
 The report still contains MAC addresses, IPs and SSIDs, so don't post it publicly.
 """
 import argparse
-import getpass
 import importlib.util
 import os
 import re
@@ -145,12 +144,12 @@ def main():
     ap = argparse.ArgumentParser(description="Read-only discovery of a UTR's SSH environment.")
     ap.add_argument("host")
     ap.add_argument("-u", "--user", default="ui")
-    ap.add_argument("-p", "--password", help="else $UTR_PASSWORD, else prompt")
+    ap.add_argument("-p", "--password", help="else $UTR_PASSWORD, else the monitor's saved password, else prompt")
     ap.add_argument("--ssh-port", type=int, default=22)
     ap.add_argument("-s", "--section", help="comma-separated: only run sections whose name contains one of these")
     ap.add_argument("-o", "--output", default=os.path.join(HERE, "utr-probe-report.txt"))
     a = ap.parse_args()
-    pw = a.password or os.environ.get("UTR_PASSWORD") or getpass.getpass(f"Password for {a.user}@{a.host}: ")
+    pw, _ = mon.resolve_password(a.user, a.host, a.password)
 
     runner = mon.SSHRunner(a.host, a.user, pw, port=a.ssh_port, timeout=15)
     lines = [f"# UTR probe report - {a.host} - {time.strftime('%Y-%m-%d %H:%M:%S %Z')}"]
