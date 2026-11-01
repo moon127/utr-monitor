@@ -250,8 +250,13 @@ Written against UTR firmware **6.6.122** (LEDE 17.01, IPQ40xx, 4 × Cortex-A7,
 
 - SQLite in WAL mode, with `samples`, `details` and `events` tables. One
   file per router, `utr-monitor-<host>.db`, in the working directory.
-- Retention is 30 days by default (`--retention-days`). Pruning runs at
-  startup and every 10 minutes.
+- **History is kept for 30 days**, then deleted. A travel router rarely
+  stays up longer than a few days to a week, so 30 days covers several
+  trips without the file growing unbounded. Pruning runs at startup and
+  every 10 minutes. `--retention-days` overrides it, but 30 days is the
+  supported default.
+- Data is stored at full resolution for the whole 30 days. Downsampling is
+  future work (see below).
 - On startup the last `--history` points are reloaded into the charts, and
   lines break across gaps rather than joining them up.
 - `--demo` never writes to a database unless `--db` is given.
@@ -276,11 +281,15 @@ Written against UTR firmware **6.6.122** (LEDE 17.01, IPQ40xx, 4 × Cortex-A7,
 
 ## Known issues and ideas
 
-- **The database grows ~27 MB a day** at default intervals, so ~800 MB at
-  30-day retention. Most of it is per-interface rates in every 2 s sample
-  (~370 bytes) and the top-process list in every detail row (~720 bytes).
-  Options: drop hidden interfaces before storing, store the top list less
-  often, or downsample older data.
+- **Future work: downsample older data.** History is kept at full
+  resolution for 30 days, and the database grows ~27 MB a day while the
+  monitor runs (~800 MB if it ran for all 30). Most of that is the
+  per-interface rates in every 2 s sample (~370 bytes) and the
+  top-process list in every detail row (~720 bytes). Planned: keep full
+  resolution for the last N days, then downsample (for example to 1-minute
+  averages) for anything older, with the cut-off configurable. Smaller
+  wins: drop hidden interfaces before storing, and store the top-process
+  list less often.
 - About 17% of CPU at idle can't be attributed to a live process. It's
   consistent with the firmware's daemons constantly starting short-lived
   shell scripts whose time isn't credited to a tracked parent.

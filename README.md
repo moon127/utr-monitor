@@ -132,7 +132,7 @@ python3 utr-monitor.py --demo
 | `--port` | `8080` | Web server port |
 | `--db PATH` | `utr-monitor-<host>.db` | SQLite file for history, in the current directory |
 | `--no-db` | off | Don't persist; keep history in memory only |
-| `--retention-days` | `30` | Delete DB rows older than this; `0` keeps everything |
+| `--retention-days` | `30` | Override the 30-day history (`0` keeps everything; see Persistence) |
 | `--once` | off | Run one detail poll, print the parsed state as JSON and exit |
 | `--demo` | off | Generate fake data instead of connecting |
 | `-v`, `--verbose` | off | Debug logging |
@@ -218,6 +218,12 @@ monitoring different routers keeps their history separate. On startup the most
 recent `--history` samples are loaded back into the charts, and lines break
 across gaps such as restarts rather than joining them up.
 
+History is kept for **30 days** and then deleted. A travel router rarely
+stays up longer than a few days to a week, so that covers several trips.
+Data is kept at full resolution for the whole period. Downsampling older
+data (for example to 1-minute averages after N days, with the cut-off
+configurable) is planned future work.
+
 `--demo` doesn't write to a DB unless you pass `--db`, so fake data never ends
 up mixed with real history.
 
@@ -243,8 +249,9 @@ Design decisions and working agreements are in [AGENTS.md](AGENTS.md).
 - With `--no-db`, history lives in memory only and is lost when the script stops.
 - The charts show at most the last `--history` samples. Older rows stay in the
   DB (up to the retention limit) and are included in the CSV export.
-- At the default intervals the DB grows by roughly 25–30 MB a day, so expect several hundred MB at the
-  default 30-day retention. Lower `--retention-days` if that matters.
+- While the monitor runs, the DB grows by roughly 25–30 MB a day at full
+  resolution. A week-long trip is around 200 MB; the 30-day limit caps it
+  at around 800 MB.
 - `mca-dump` is the heaviest command the script runs. If the router's CPU climbs noticeably, raise `--detail-interval`.
 - The detail parsing was written against UTR firmware 6.6.122. Other versions may name fields differently; `--once` shows what's being picked up.
 - With the `top` fallback, some BusyBox builds report CPU averaged since boot
