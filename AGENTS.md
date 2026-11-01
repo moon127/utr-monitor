@@ -21,6 +21,7 @@ scripts run from a local virtualenv on the owner's Mac.
 | `docs/` | Screenshots, generated from `--demo` only |
 | `pyproject.toml` | pytest and coverage configuration (90% coverage gate) |
 | `requirements*.txt` | Runtime and development dependencies |
+| `LICENSE` | MIT licence, copyright Gareth Woolridge |
 
 ## Working agreements
 

@@ -265,3 +265,9 @@ Design decisions and working agreements are in [AGENTS.md](AGENTS.md).
   several, each shows the shared port total, labelled as such.
 - Interface counters that reset or wrap are skipped for that sample rather than
   shown as a spike.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+UniFi, UniFi Teleport and the related product names are trademarks of Ubiquiti Inc. This is an independent project, not affiliated with or endorsed by Ubiquiti.
