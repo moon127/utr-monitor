@@ -67,7 +67,7 @@ firmware exposes.
 ```bash
 python3 -m venv my-venv
 source my-venv/bin/activate
-pip install paramiko keyring
+pip install -r requirements.txt     # paramiko, plus keyring to remember the password
 ```
 
 ## Usage
@@ -224,12 +224,27 @@ up mixed with real history.
 **Reset data** asks for confirmation, then deletes all rows in all three tables and
 compacts the file. Events already in the router's log aren't re-imported afterwards. Other open browser tabs pick up the reset on their next poll.
 
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite runs against fictional router output (`tests/helpers.py`) and fake
+SSH sessions, so it needs no router. It enforces at least 90% coverage of both
+scripts, branches included. With `node` installed it also runs the dashboard's
+JavaScript against hostile router strings to check everything is escaped.
+
+Design decisions and working agreements are in [AGENTS.md](AGENTS.md).
+
 ## Caveats
 
 - With `--no-db`, history lives in memory only and is lost when the script stops.
 - The charts show at most the last `--history` samples. Older rows stay in the
   DB (up to the retention limit) and are included in the CSV export.
-- At the default intervals the DB grows by roughly 43,000 samples and 8,600 detail rows a day, a few MB.
+- At the default intervals the DB grows by roughly 25–30 MB a day, so expect several hundred MB at the
+  default 30-day retention. Lower `--retention-days` if that matters.
 - `mca-dump` is the heaviest command the script runs. If the router's CPU climbs noticeably, raise `--detail-interval`.
 - The detail parsing was written against UTR firmware 6.6.122. Other versions may name fields differently; `--once` shows what's being picked up.
 - With the `top` fallback, some BusyBox builds report CPU averaged since boot
