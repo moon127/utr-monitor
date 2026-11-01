@@ -1,0 +1,3 @@
+paramiko>=2.7
+# Optional: remember the SSH password in the system keychain
+keyring>=23

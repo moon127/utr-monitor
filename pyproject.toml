@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov --cov-report=term-missing --cov-fail-under=90"
+
+[tool.coverage.run]
+source = ["."]
+omit = ["tests/*", "my-venv/*"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if __name__ == .__main__.:"]
