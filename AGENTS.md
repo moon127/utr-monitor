@@ -35,7 +35,8 @@ scripts run from a local virtualenv on the owner's Mac.
 - Agent-authored commits end with the agent's `Co-Authored-By` trailer.
   Never include session links (a `Claude-Session:` trailer or any
   claude.ai URL) in commit messages or PR descriptions.
-- There's no remote. Don't push, add remotes or rewrite pushed history
+- The remote is `origin` on GitHub (`moon127/utr-monitor`). Push only
+  `main`, never `--all`. Don't push, add remotes or rewrite pushed history
   without being asked.
 - Never commit data from the real network: databases, probe reports,
   `--once` JSON, `.DS_Store`, local archives (e.g. `utr-monitor.tar`) or
