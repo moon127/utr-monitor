@@ -33,6 +33,8 @@ scripts run from a local virtualenv on the owner's Mac.
 - One commit per feature or fix. Imperative subject line; the body explains
   *why* and any behaviour a user would notice.
 - Agent-authored commits end with the agent's `Co-Authored-By` trailer.
+  Never include session links (a `Claude-Session:` trailer or any
+  claude.ai URL) in commit messages or PR descriptions.
 - There's no remote. Don't push, add remotes or rewrite pushed history
   without being asked.
 - Never commit data from the real network: databases, probe reports,
